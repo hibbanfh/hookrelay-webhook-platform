@@ -70,7 +70,10 @@ Acceptance criteria (QA verifies during kickoff):
 
 ## P0: MVP
 
-### US-001: Create a project and authenticate with an API key            [status: in-progress]  [priority: P0]
+### US-001: Create a project and authenticate with an API key            [status: done]  [priority: P0]
+
+> **Done 2026-11-09.** All 9 criteria verified on the real binary against real PostgreSQL 16, plus unit and Testcontainers integration tests with `-race` (Go 1.26.10, Linux container). Evidence in `docs/test-plan.md`. Closing it found and fixed BUG-QA-010. CI confirmation is pending the push of that fix and the Go bump.
+
 As a platform developer, I want to create a project and receive an API key so that I can call
 the Hookrelay API securely, with my data kept separate from other projects.
 
@@ -109,7 +112,7 @@ Notes / out of scope:
 
 ### US-025: Sign up / sign in with Neon Auth and session verification            [status: done]  [priority: P0]
 
-> **Done 2026-11-09.** Verified by Go unit + Testcontainers integration tests, vitest (73), live QA against real Neon Auth. Carried forward: criterion 14 clause "endpoint / message / delivery of another user returns 404" cannot be tested until those routes exist (US-002/003/006 must add the cross-user test); `go test -race` and the new sign-in/sign-out Playwright test (`E2E_NEON=1`) have not been run locally, so CI is their first run.
+> **Done 2026-11-09.** Verified by Go unit + Testcontainers integration tests, vitest (73), live QA against real Neon Auth. Carried forward: criterion 14 clause "endpoint / message / delivery of another user returns 404" cannot be tested until those routes exist (US-002/003/006 must add the cross-user test); the new sign-in/sign-out Playwright test (`E2E_NEON=1`) has not been run. `go test -race` passed on 2026-11-09 in a Linux container (see US-001 closure in `docs/test-plan.md`).
 As a platform developer, I want to create an account with my email and password and sign in to
 the dashboard, so that I get my own project without anyone handing me an API key, and only I can
 see its data.
@@ -591,3 +594,9 @@ multi-language SDKs. See `docs/PRD.md` section 5.
 
 ### BUG-QA-009: US-025 E2E spec used an ambiguous `getByRole("alert")`   [minor]
 - **Status: fixed by QA.** Next.js injects its own `role=alert` route announcer, so `frontend/e2e/auth.spec.ts` "wrong password and unknown email" failed with a strict-mode violation although the UI was correct. Now `form [role=alert]`, plus assertions that the URL stays `/sign-in` and no `hr_session` cookie is set.
+
+### BUG-QA-010: invalid UTF-8 in a project name returned 201 (US-001)   [major] - FIXED
+- **Status: fixed.** `entity.NewProject` now also rejects U+FFFD with `400 validation_error` on `name`. Side effect: a client that deliberately sends a literal U+FFFD is rejected too, because after decoding the two cases cannot be told apart.
+- **Repro:** `POST /v1/projects` with a body file containing the raw byte `0xFF` inside `name`. Expected `400`, field `name`. Actual `201`, name stored with U+FFFD.
+- **Cause:** `encoding/json` replaces invalid UTF-8 with U+FFFD while decoding, so the `utf8.ValidString` guard could never fire over HTTP. The entity test passed because it called `NewProject` directly with the raw byte.
+- **Test:** `TestCreateProjectRejectsControlCharacters` (invalid byte, truncated sequence, replacement character), `TestNewProject`.

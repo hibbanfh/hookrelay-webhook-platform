@@ -19,6 +19,24 @@ Black-box runs used the real binary `go build ./cmd/server` + `curl`, with `DATA
 | 7 | Creation disabled -> 403 forbidden, nothing created | PASS | `TestCreateProjectDisabledReturns403AndCreatesNothing`; real binary `PROJECT_CREATION_ENABLED=false` -> 403. See BUG-QA-006. |
 | 8 | Two projects: key A returns project A only | PASS (in-memory); DB NOT VERIFIABLE | `TestGetCurrentProjectReturnsOnlyTheCallersProject`, `TestAuthenticateAPIKeyIsolatesProjects`. |
 
+### US-001 closure run (2026-11-09): supersedes the NOT VERIFIABLE verdicts above
+
+Real binary, migrated throwaway `postgres:16-alpine`, `curl`. Bodies with non-ASCII bytes were sent from a file, because Windows shell arguments rewrite them.
+
+| # | Acceptance criterion | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Create project, no auth | PASS | `POST /v1/projects` -> 201 with `proj_` id, name, created_at, api_key |
+| 2 | Plaintext key stored nowhere | PASS | `pg_dump` contains neither key (0 hits), nor does the API log; `api_keys` has `key_hash bytea` and an 8-character `key_prefix` |
+| 3 | Key never in later reads | PASS | `GET /v1/project` body has no `api_key` and no key substring |
+| 4 | Empty / whitespace / 101 characters | PASS | 400 `validation_error`, `field: name` for all three |
+| 5 | Control, bidi, invalid UTF-8 | PASS after fix | NUL, newline, tab, U+202E (escaped and raw), byte `0xFF`, truncated sequence all 400 on `name`; a valid non-ASCII name still 201. BUG-QA-010 was found here |
+| 6 | Valid key -> own project | PASS | 200 with id, name, created_at, no key material |
+| 7 | Missing / non-Bearer / unknown key | PASS | three identical 401 `unauthorized` bodies, unknown key checked against the real DB |
+| 8 | Creation disabled | PASS | 403 `forbidden`, project count 5 before and after |
+| 9 | Key A returns project A only | PASS | keys A and B return their own distinct project ids |
+
+Also run: migrations up, `seed` twice (`created:true`, then `created:false`), seeded key -> 200, `/healthz` 200 with DB up and 503 with DB stopped. Gates: `gofmt`, `go vet -tags integration`, `golangci-lint` (0 issues), `check-layers.sh`, `govulncheck` (no vulnerabilities on Go 1.26.10), `go test -race -count=1 -tags integration ./...` in `golang:1.26-bookworm` (all packages ok, real Postgres via Testcontainers).
+
 Extra probes: Bearer case-insensitivity, extra spaces accepted (`Bearer   key` -> 200), tab/two tokens/quotes -> 401; malformed JSON (15 bodies) -> 400; unknown field -> 400; body-size boundary (limit == size -> 201, size-1 -> 413); `Cache-Control: no-store` on the 201; duplicate creates yield distinct projects/keys; method/path matrix; DB outage during auth gives 500 not 401. Timing: lookup is by SHA-256 hash equality in SQL (no plaintext comparison in Go), so key-guessing timing leaks only hash-prefix information; acceptable. Not tested: real concurrency (needs DB), GET /v1/project has no `Cache-Control` (not required).
 
 ## Milestone 0 (backend parts)

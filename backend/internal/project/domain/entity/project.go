@@ -41,7 +41,8 @@ func NewProject(id, name string, now time.Time) (Project, error) {
 	if name == "" {
 		return Project{}, &domainerrors.ValidationError{Field: fieldName, Reason: "must not be empty"}
 	}
-	if !utf8.ValidString(name) {
+	// encoding/json turns invalid UTF-8 into U+FFFD, so that rune is the only trace of it over HTTP.
+	if !utf8.ValidString(name) || strings.ContainsRune(name, utf8.RuneError) {
 		return Project{}, &domainerrors.ValidationError{Field: fieldName, Reason: "must be valid UTF-8"}
 	}
 	if utf8.RuneCountInString(name) > maxNameLength {

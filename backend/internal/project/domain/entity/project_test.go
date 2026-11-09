@@ -44,6 +44,7 @@ func TestNewProject(t *testing.T) {
 		{name: "bidi isolate PDI", in: "a\u2069b", wantErr: true},
 		{name: "invalid UTF-8", in: "a\xffb", wantErr: true},
 		{name: "truncated UTF-8 sequence", in: "ab\xe6\x97", wantErr: true},
+		{name: "replacement character left by the JSON decoder", in: "a\ufffdb", wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

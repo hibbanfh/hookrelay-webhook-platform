@@ -714,6 +714,12 @@ func TestCreateProjectRejectsControlCharacters(t *testing.T) {
 		{"DEL", `{"name":"a\u007fb"}`},
 		{"C1 control", `{"name":"a\u0085b"}`},
 		{"NUL at the end", `{"name":"ab\u0000"}`},
+		{"bidi override escaped", `{"name":"a\u202eb"}`},
+		{"bidi override raw", "{\"name\":\"a\u202eb\"}"},
+		{"bidi isolate", `{"name":"a\u2066b"}`},
+		{"invalid UTF-8 byte", "{\"name\":\"a\xffb\"}"},
+		{"truncated UTF-8 sequence", "{\"name\":\"a\xe2\x82b\"}"},
+		{"replacement character", `{"name":"a\ufffdb"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

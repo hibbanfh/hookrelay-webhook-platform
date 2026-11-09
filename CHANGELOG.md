@@ -9,7 +9,7 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
   - Go: `RequireProject` middleware accepts a Bearer API key or a Neon session (`X-Hookrelay-Session`), verified against Neon `get-session` with a 5 s positive cache (singleflight), fail-closed `503 auth_unavailable`; `POST /v1/me/project` provisions one project per user (race-safe via `projects.neon_user_id` unique, migration 0002) and returns the API key once.
   - Next.js: `/sign-up`, `/sign-in`, sign-out, server-side BFF routes that keep the Neon session in an encrypted httpOnly `hr_session` cookie, `/api/v1/*` proxy with Origin checks, route-protecting middleware, one-time API key dialog.
   - Fixed during QA: open redirect via `?next=`, redirect loop on an undecryptable session cookie.
-- US-001 (backend, **pending DB verification**): create a project and authenticate with an API key.
+- US-001: create a project and authenticate with an API key.
   - `POST /v1/projects` (key shown once, stored only as SHA-256 hash), `GET /v1/project`,
     Bearer auth middleware with an identical 401 for every bad-key case, `PROJECT_CREATION_ENABLED` switch.
   - Idempotent `hookrelay seed` for the demo project.
@@ -19,8 +19,12 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 - Docs: PRD, backlog, architecture, OpenAPI contract, ADRs 0001-0010, test plan.
 - Engineering standard `.claude/references/backend-architecture.md`, enforced by golangci-lint (depguard, nestif) and `scripts/check-layers.sh`.
 
+### Fixed
+- US-001: invalid UTF-8 in a project name is now `400 validation_error` on `name` instead of `201` (BUG-QA-010).
+
+### Security
+- Go raised from 1.26.0 to 1.26.10, closing 28 standard-library vulnerabilities reported by `govulncheck`.
+
 ### Known gaps
-- Nothing that touches PostgreSQL has been run (no container runtime on the dev machine): SQL, migrations,
-  Testcontainers tests, `seed` against a DB, `/healthz` 200.
-- `go test -race` has not been run (no cgo locally); CI will be its first run.
-- Frontend and E2E are deferred.
+- Sign-in/sign-out Playwright test in `frontend/e2e/auth.spec.ts` (`E2E_NEON=1`) has not been run.
+- US-025 criterion 14 (cross-user endpoint, message and delivery isolation) waits for those routes (US-002, US-003, US-006).

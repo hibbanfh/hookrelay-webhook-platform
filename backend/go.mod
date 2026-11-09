@@ -1,6 +1,6 @@
 module hookrelay
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/golang-migrate/migrate/v4 v4.18.3
