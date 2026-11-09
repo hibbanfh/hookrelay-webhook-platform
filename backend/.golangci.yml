@@ -1,0 +1,239 @@
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration] # lint the Testcontainers tests too
+
+# Flat control flow (see .claude/references/backend-architecture.md section 2) and the
+# dependency rule (section 1) are enforced here. scripts/check-layers.sh is the
+# grep-based backstop that CI runs as well.
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - errorlint
+    - revive
+    - gocritic
+    - nestif
+    - gocognit
+    - cyclop
+    - depguard
+  settings:
+    cyclop:
+      max-complexity: 10
+    gocognit:
+      min-complexity: 12
+    nestif:
+      # 1 means any if nested inside another if is reported.
+      min-complexity: 1
+    gocritic:
+      enabled-tags: [diagnostic, style, performance]
+      disabled-checks:
+        - hugeParam
+        - ifElseChain # covered by revive early-return / superfluous-else
+    revive:
+      rules:
+        - name: early-return
+        - name: indent-error-flow
+        - name: superfluous-else
+        - name: exported
+        - name: error-return
+        - name: error-naming
+        - name: error-strings
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: var-naming
+        - name: unused-parameter
+        - name: argument-limit
+          arguments: [4]
+        - name: max-control-nesting
+          arguments: [1]
+    depguard:
+      rules:
+        # The rules below encode the per-module sub-package layout (ADR 0010). They name the
+        # project module; a new module copies the block and swaps the module name.
+        # `lax` mode: everything not denied is allowed, and an `allow` entry exempts a more
+        # specific path from a broader `deny` prefix.
+        # --- domain/errors: stdlib only ---------------------------------------------
+        domain-errors:
+          list-mode: lax
+          files: ["**/internal/project/domain/errors/**", "!$test"]
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "domain/errors imports nothing from this repo"}
+        # --- domain/entity: stdlib + domain/errors ----------------------------------
+        domain-entity:
+          list-mode: lax
+          files: ["**/internal/project/domain/entity/**", "!$test"]
+          allow:
+            - hookrelay/internal/project/domain/errors
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "entity imports domain/errors only"}
+        # --- domain/repository: ports over entity + errors --------------------------
+        domain-repository:
+          list-mode: lax
+          files: ["**/internal/project/domain/repository/**", "!$test"]
+          allow:
+            - hookrelay/internal/project/domain/entity
+            - hookrelay/internal/project/domain/errors
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "repository ports import entity and errors only"}
+        # --- domain/usecase: application rules over domain/* ------------------------
+        domain-usecase:
+          list-mode: lax
+          files: ["**/internal/project/domain/usecase/**", "!$test"]
+          allow:
+            - hookrelay/internal/project/domain/entity
+            - hookrelay/internal/project/domain/errors
+            - hookrelay/internal/project/domain/repository
+          deny:
+            - {pkg: net/http, desc: "use cases must not know HTTP"}
+            - {pkg: github.com, desc: "use cases must not know pgx or other third-party adapters"}
+            - {pkg: golang.org, desc: "use cases import the stdlib and domain/* only"}
+            - {pkg: hookrelay, desc: "use cases import domain/* only (not data, delivery or platform)"}
+        # --- data/model: plain row structs ------------------------------------------
+        data-model:
+          list-mode: lax
+          files: ["**/internal/project/data/model/**", "!$test"]
+          deny:
+            - {pkg: github.com, desc: "models are plain structs"}
+            - {pkg: golang.org, desc: "models are plain structs"}
+            - {pkg: hookrelay, desc: "models import nothing from this repo"}
+        # --- data/source: SQL + pgx, returns models ---------------------------------
+        data-source:
+          list-mode: lax
+          files: ["**/internal/project/data/source/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project/domain, desc: "sources return models, not entities"}
+            - {pkg: hookrelay/internal/project/delivery, desc: "data must not import delivery"}
+            - {pkg: hookrelay/internal/project/data/repository, desc: "sources do not know repositories"}
+        # --- data/repository: models <-> entities, no SQL ---------------------------
+        data-repository:
+          list-mode: lax
+          files: ["**/internal/project/data/repository/**", "!$test"]
+          deny:
+            - {pkg: github.com/jackc, desc: "SQL and pgx belong to data/source"}
+            - {pkg: net/http, desc: "repositories must not know HTTP"}
+            - {pkg: hookrelay/internal/project/delivery, desc: "data must not import delivery"}
+            - {pkg: hookrelay/internal/project/domain/usecase, desc: "data must not import use cases"}
+            - {pkg: hookrelay/internal/platform, desc: "repositories reach storage through data/source"}
+        # --- data/neonauth: outbound HTTP adapter to the identity provider ----------
+        data-neonauth:
+          list-mode: lax
+          files: ["**/internal/project/data/neonauth/**", "!$test"]
+          deny:
+            - {pkg: github.com/jackc, desc: "the identity adapter does not touch the database"}
+            - {pkg: hookrelay/internal/platform, desc: "adapters reach their config through constructor options"}
+            - {pkg: hookrelay/internal/project/delivery, desc: "data must not import delivery"}
+            - {pkg: hookrelay/internal/project/domain/usecase, desc: "data must not import use cases"}
+            - {pkg: hookrelay/internal/project/data/source, desc: "the identity adapter does not use SQL sources"}
+            - {pkg: hookrelay/internal/project/data/repository, desc: "the identity adapter does not use repositories"}
+        # --- delivery/dto: plain request/response structs ---------------------------
+        delivery-dto:
+          list-mode: lax
+          files: ["**/internal/project/delivery/dto/**", "!$test"]
+          allow:
+            - hookrelay/internal/project/domain/entity
+          deny:
+            - {pkg: net/http, desc: "DTOs are plain structs"}
+            - {pkg: github.com, desc: "DTOs are plain structs"}
+            - {pkg: hookrelay, desc: "DTOs import domain/entity at most"}
+        # --- delivery/presenter/http: handlers over use cases -----------------------
+        delivery-presenter:
+          list-mode: lax
+          files: ["**/internal/project/delivery/presenter/**", "!$test"]
+          deny:
+            - {pkg: github.com/jackc, desc: "delivery must not touch the database"}
+            - {pkg: hookrelay/internal/platform/postgres, desc: "delivery must not touch the database"}
+            - {pkg: hookrelay/internal/project/data, desc: "delivery must not import data"}
+            - {pkg: hookrelay/internal/project/domain/repository, desc: "delivery calls use cases, not repository ports"}
+        # --- nothing but cmd/server imports data or presenter -----------------------
+        no-importing-presenter:
+          list-mode: lax
+          files: ["**/internal/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project/delivery/presenter, desc: "only cmd/server wiring imports presenters"}
+        no-importing-data:
+          list-mode: lax
+          files: ["**/internal/**", "!**/internal/project/data/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project/data, desc: "only cmd/server wiring (and data itself) imports data"}
+        # --- platform must never import a domain ------------------------------------
+        platform-no-domains:
+          list-mode: lax
+          files: ["**/internal/platform/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project, desc: "platform must not import a domain"}
+            - {pkg: hookrelay/internal/endpoint, desc: "platform must not import a domain"}
+            - {pkg: hookrelay/internal/message, desc: "platform must not import a domain"}
+            - {pkg: hookrelay/internal/dispatch, desc: "platform must not import a domain"}
+            - {pkg: hookrelay/internal/demoreceiver, desc: "platform must not import a domain"}
+        # --- a domain never imports another domain (use caller-declared ports) ------
+        project-no-other-domains:
+          list-mode: lax
+          files: ["**/internal/project/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/endpoint, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/message, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/dispatch, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/demoreceiver, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+        endpoint-no-other-domains:
+          list-mode: lax
+          files: ["**/internal/endpoint/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/message, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/dispatch, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/demoreceiver, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+        message-no-other-domains:
+          list-mode: lax
+          files: ["**/internal/message/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/endpoint, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/dispatch, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/demoreceiver, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+        dispatch-no-other-domains:
+          list-mode: lax
+          files: ["**/internal/dispatch/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/endpoint, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/message, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/demoreceiver, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+        demoreceiver-no-other-domains:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/project, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/endpoint, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/message, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+            - {pkg: hookrelay/internal/dispatch, desc: "cross-domain calls go through ports + cmd/server/adapters.go"}
+  exclusions:
+    generated: lax
+    paths:
+      - sqlcgen
+    rules:
+      # Table-driven tests nest a loop and a closure by design.
+      - path: _test\.go
+        linters: [nestif, gocognit, cyclop, revive, gocritic]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

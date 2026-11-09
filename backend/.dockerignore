@@ -1,0 +1,7 @@
+.git
+*.exe
+*.test
+*.out
+coverage.*
+Dockerfile
+.golangci.yml

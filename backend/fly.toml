@@ -1,0 +1,65 @@
+# Fly.io config for the Go backend (one image, two process groups: ADR 0002).
+# Lives in backend/ because the Docker build context is backend/. Deploy with:
+#   cd backend && fly deploy
+# One-time setup (secrets live only in Fly, never in this file):
+#   fly apps create hookrelay
+#   fly secrets set DATABASE_URL=... SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32) SEED_DEMO_API_KEY=hr_...
+#   fly ssh console -C "/hookrelay seed"          # after the first deploy
+#   fly scale count api=1 worker=1
+app = "hookrelay"
+primary_region = "iad"
+# SIGTERM, then SIGKILL after 30 s. WORKER_SHUTDOWN_TIMEOUT (25 s) must stay below this.
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile"
+
+[deploy]
+  # Runs in a temporary machine before new machines start. Old code must tolerate the new schema.
+  release_command = "/hookrelay migrate up"
+  strategy = "rolling"
+
+[env]
+  APP_ENV = "production"
+  HTTP_ADDR = ":8080"
+  WORKER_HEALTH_ADDR = ":9091"
+  PUBLIC_BASE_URL = "https://hookrelay.fly.dev"
+  LOG_LEVEL = "info"
+
+[processes]
+  api = "/hookrelay api"
+  worker = "/hookrelay worker"
+
+# Only the api group is exposed. The worker has no http_service, so Fly never auto-stops it.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["api"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "15s"
+    timeout = "3s"
+    method = "GET"
+    path = "/healthz"
+
+# Private health check for the worker group (reports 503 once the claim loop stalls).
+[checks]
+  [checks.worker_health]
+    type = "http"
+    port = 9091
+    path = "/healthz"
+    method = "GET"
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "15s"
+    processes = ["worker"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["api", "worker"]
