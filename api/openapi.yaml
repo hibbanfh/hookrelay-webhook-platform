@@ -1,0 +1,974 @@
+openapi: 3.1.0
+info:
+  title: Hookrelay API
+  version: 0.1.0
+  summary: Publish webhooks with one API call; Hookrelay signs, delivers, retries and logs them.
+  description: |
+    Hookrelay is a small, self-hostable webhook sending service.
+
+    ## Conventions
+    - **Auth (ADR 0011):** every `/v1/*` route except `POST /v1/projects` needs exactly one credential:
+      `Authorization: Bearer <api_key>` (programmatic clients), or `X-Hookrelay-Session: <Neon Auth session>`
+      (sent only by the dashboard BFF, never by browsers). `POST /v1/me/project` accepts only the session.
+      A missing, malformed, unknown, revoked, expired or signed-out credential, and a request that sends both,
+      all return `401 unauthorized` with an identical body. A request without a credential never reaches the
+      identity provider. If Neon Auth cannot verify a session (timeout, error), the API fails closed with
+      `503 auth_unavailable`. A verified user who has no project yet gets `409 project_not_provisioned`
+      (call `POST /v1/me/project`).
+    - **Tenant isolation:** a resource owned by another project returns `404 not_found`, never `403`.
+    - **Errors:** always `{"error":{"code":"<snake_case>","message":"...","field":"<optional>"}}`.
+      5xx responses never contain stack traces or SQL.
+    - **Pagination:** cursor based. `limit` defaults to 20, max 100 (above 100 returns 400).
+      Responses are `{"data":[...],"next_cursor":"..."|null}`. `next_cursor` is `null` on the last page.
+      Cursors are opaque; do not parse them.
+    - **IDs:** opaque strings with a type prefix (`proj_`, `key_`, `ep_`, `msg_`, `dlv_`, `att_`) followed by a ULID.
+    - **Timestamps:** RFC 3339, UTC.
+    - **Request IDs:** every response carries `X-Request-Id`: echoed from the request when it matches
+      `^[A-Za-z0-9._-]{1,64}$`, otherwise generated.
+    - **Content-Type:** request bodies are parsed as JSON whatever `Content-Type` the client sends
+      (lenient by design; there is no `415`).
+    - **Body limit:** request bodies larger than 256 KB return `413 payload_too_large`.
+    - **Environment mode:** `development` allows `http://` and `localhost` endpoint URLs. `production` requires
+      `https://` and blocks private, loopback, link-local and unique-local destinations.
+  license:
+    name: MIT
+    identifier: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development (docker compose)
+  - url: https://hookrelay.fly.dev
+    description: Public demo (production mode)
+
+security:
+  - apiKey: []
+  - session: []
+
+tags:
+  - name: system
+  - name: projects
+  - name: endpoints
+  - name: messages
+  - name: deliveries
+  - name: demo
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: Health check including database reachability
+      security: []
+      responses:
+        "200":
+          description: The process is up and the database answered within 1 second.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: ok, checks: { database: ok } }
+        "503":
+          description: The database is unreachable or did not answer in time.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+              example: { status: unavailable, checks: { database: unreachable } }
+
+  /v1/projects:
+    post:
+      tags: [projects]
+      operationId: createProject
+      summary: Create a project and receive its API key (shown once)
+      description: |
+        Disabled in production by configuration (`PROJECT_CREATION_ENABLED=false`), in which case it
+        returns `403 forbidden` and creates nothing. Enabled by default in development mode.
+        The plaintext `api_key` is returned only in this response and is never stored.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProjectRequest" }
+            example: { name: Acme }
+      responses:
+        "201":
+          description: Project created.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectCreated" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/Internal" }
+
+  /v1/project:
+    get:
+      tags: [projects]
+      operationId: getCurrentProject
+      summary: Get the project the API key belongs to
+      responses:
+        "200":
+          description: The authenticated project. Contains no key material.
+          headers:
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Project" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/me/project:
+    post:
+      tags: [projects]
+      operationId: ensureMyProject
+      summary: Get or create the signed-in user's project (API key shown once, on creation)
+      description: |
+        Idempotent. Each Neon Auth user owns exactly one project. The first call creates it (name "My project")
+        with an API key and returns `201`. That response is the only place the plaintext `api_key` ever
+        appears. Every later call, including concurrent ones that lost the race, returns `200` with the
+        project and no key. The dashboard calls this before any other API request. No request body.
+        Session only: an API key is not accepted here.
+      security:
+        - session: []
+      responses:
+        "200":
+          description: The project already existed. No key material.
+          headers:
+            Cache-Control: { $ref: "#/components/headers/NoStore" }
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Project" }
+        "201":
+          description: Created by this call. `api_key` is shown once and cannot be retrieved again.
+          headers:
+            Cache-Control: { $ref: "#/components/headers/NoStore" }
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectCreated" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/endpoints:
+    get:
+      tags: [endpoints]
+      operationId: listEndpoints
+      summary: List endpoints, newest first
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of endpoints. List items never contain `signing_secret`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EndpointList" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+    post:
+      tags: [endpoints]
+      operationId: createEndpoint
+      summary: Register a receiver URL; returns its signing secret
+      description: |
+        Validation: `url` must be an absolute `http(s)` URL of at most 2048 characters; `description` at most
+        255 characters. In production mode the URL must be `https://` and its host must not be, or resolve to,
+        a loopback, private (RFC 1918), link-local (incl. `169.254.169.254`), CGNAT, unique-local IPv6 or other
+        non-public address, unless it matches the operator allowlist (the built-in demo receiver).
+        A project may have at most 20 endpoints (configurable); creating more returns `409 conflict`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateEndpointRequest" }
+            example: { url: "https://example.com/hook", description: Acme prod }
+      responses:
+        "201":
+          description: Endpoint created. `signing_secret` is included.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EndpointWithSecret" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/endpoints/{endpoint_id}:
+    parameters:
+      - $ref: "#/components/parameters/EndpointID"
+    get:
+      tags: [endpoints]
+      operationId: getEndpoint
+      summary: Get one endpoint (without its secret)
+      responses:
+        "200":
+          description: The endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+    patch:
+      tags: [endpoints]
+      operationId: updateEndpoint
+      summary: Update url, description and/or enabled
+      description: |
+        Partial update. Omitted fields are unchanged; at least one field is required. The same validation rules
+        as create apply. Disabling an endpoint makes its not-yet-attempted deliveries fail with
+        `endpoint_disabled` when they come due. Concurrent patches of different fields do not overwrite each other.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateEndpointRequest" }
+            example: { enabled: false }
+      responses:
+        "200":
+          description: The updated endpoint.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Endpoint" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/endpoints/{endpoint_id}/secret:
+    parameters:
+      - $ref: "#/components/parameters/EndpointID"
+    get:
+      tags: [endpoints]
+      operationId: getEndpointSecret
+      summary: Reveal the endpoint's signing secret
+      responses:
+        "200":
+          description: The signing secret.
+          headers:
+            Cache-Control:
+              description: Always `no-store`.
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EndpointSecret" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/endpoints/{endpoint_id}/deliveries:
+    parameters:
+      - $ref: "#/components/parameters/EndpointID"
+    get:
+      tags: [deliveries]
+      operationId: listEndpointDeliveries
+      summary: List one endpoint's deliveries, newest first, optionally filtered by status
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Only return deliveries in this status. Any other value returns `400 validation_error`.
+          schema: { $ref: "#/components/schemas/DeliveryStatus" }
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of deliveries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeliveryList" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/messages:
+    get:
+      tags: [messages]
+      operationId: listMessages
+      summary: List messages, newest first, with a delivery summary
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of messages (without payloads).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageList" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+    post:
+      tags: [messages]
+      operationId: publishMessage
+      summary: Publish an event; fans out to every enabled endpoint asynchronously
+      description: |
+        Returns `202` after the message and one `pending` delivery per currently enabled endpoint have been
+        committed in a single transaction. Makes no outbound HTTP call. Endpoints registered later do not receive
+        this message.
+
+        **Idempotency:** send `Idempotency-Key` to make retries safe. Keys are scoped per project and live
+        24 hours. Repeating the same key with an identical `event_type` and `payload` returns the original
+        response (same message `id`) with header `Idempotent-Replayed: true` and creates nothing. Reusing a key
+        with a different body returns `422 idempotency_key_mismatch`. Concurrent requests with the same key
+        produce exactly one message.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PublishMessageRequest" }
+            example:
+              event_type: invoice.paid
+              payload: { id: inv_1, amount: 1200 }
+      responses:
+        "202":
+          description: Accepted. Deliveries are queued.
+          headers:
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+            X-Request-Id: { $ref: "#/components/headers/XRequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageAccepted" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/IdempotencyKeyMismatch" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/messages/{message_id}:
+    parameters:
+      - $ref: "#/components/parameters/MessageID"
+    get:
+      tags: [messages]
+      operationId: getMessage
+      summary: Get a message with its exact payload and all its deliveries
+      description: |
+        `payload` is returned byte-for-byte as published (embedded as raw JSON). `deliveries` is not paginated:
+        a message has at most one delivery per endpoint, and a project has at most 20 endpoints.
+      responses:
+        "200":
+          description: The message.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MessageDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/deliveries/{delivery_id}/attempts:
+    parameters:
+      - $ref: "#/components/parameters/DeliveryID"
+    get:
+      tags: [deliveries]
+      operationId: listDeliveryAttempts
+      summary: List a delivery's attempts, oldest first
+      description: Ordered by `attempt_number` ascending (the one exception to newest-first lists).
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of attempts.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AttemptList" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/ProjectNotProvisioned" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /v1/deliveries/{delivery_id}/replay:
+    parameters:
+      - $ref: "#/components/parameters/DeliveryID"
+    post:
+      tags: [deliveries]
+      operationId: replayDelivery
+      summary: Manually re-send a `failed` or `succeeded` delivery
+      description: |
+        Moves the delivery back to `pending` with `trigger: manual`; the worker makes one attempt within seconds,
+        with the same `webhook-id` and body, a fresh `webhook-timestamp` and a recomputed signature, to the
+        endpoint's *current* URL and secret. A failed manual attempt is not retried automatically.
+        Returns `409 conflict` if the delivery is already `pending` or its endpoint is disabled. No request body.
+      responses:
+        "202":
+          description: Replay queued. Returns the delivery in its new `pending` state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Delivery" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "500": { $ref: "#/components/responses/Internal" }
+        "503": { $ref: "#/components/responses/AuthUnavailable" }
+
+  /demo/receiver/{project_id}:
+    parameters:
+      - name: project_id
+        in: path
+        required: true
+        description: The project whose demo endpoints may be sending to this URL.
+        schema: { $ref: "#/components/schemas/ProjectID" }
+    post:
+      tags: [demo]
+      operationId: demoReceive
+      summary: Built-in demo receiver that verifies signatures and can fail on purpose
+      description: |
+        A receiver for demos and E2E tests, hosted by the API process. Register
+        `{demo_receiver_url}?fail_first=N` (see `Project.demo_receiver_url`) as an endpoint URL.
+
+        1. Verifies the Standard Webhooks signature against the signing secrets of this project's endpoints whose
+           URL points at this receiver. Invalid, missing or stale (more than 5 minutes) signatures return `401`.
+        2. Counts requests per (endpoint, `webhook-id`). The first `fail_first` requests return `500`; later ones
+           return `200`. Retries and replays of the same message therefore succeed once the count is exceeded.
+
+        Not authenticated with an API key; it is the target of signed webhooks. Only enabled when
+        `DEMO_RECEIVER_ENABLED=true`, otherwise `404`.
+      security: []
+      parameters:
+        - name: fail_first
+          in: query
+          required: false
+          description: Number of initial requests per webhook-id to answer with 500.
+          schema: { type: integer, minimum: 0, maximum: 10, default: 0 }
+        - $ref: "#/components/parameters/WebhookIDHeader"
+        - $ref: "#/components/parameters/WebhookTimestampHeader"
+        - $ref: "#/components/parameters/WebhookSignatureHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Signature valid; request accepted.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DemoReceiverResult" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "500":
+          description: Simulated failure (`code` is `simulated_failure`), or a genuine internal error (`code` is `internal`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error: { code: simulated_failure, message: "demo receiver failing on purpose (request 1 of 2)" }
+
+webhooks:
+  messageDelivery:
+    post:
+      summary: What Hookrelay sends to a registered endpoint
+      description: |
+        One request per delivery attempt. Signed with the endpoint's secret using the
+        [Standard Webhooks](https://www.standardwebhooks.com/) scheme:
+        `webhook-signature: v1,<base64(HMAC-SHA256(key, "{webhook-id}.{webhook-timestamp}.{body}"))>`,
+        where `key` is the base64-decoded part of `whsec_<base64>`. Multiple signatures may be space-separated
+        (reserved for secret rotation, P1).
+
+        Success is any `2xx` within the timeout (10 s by default). Redirects are not followed. The body is the
+        published payload, byte-for-byte. `webhook-id` is the message ID and is stable across retries and replays,
+        so receivers can deduplicate (delivery is at-least-once).
+      parameters:
+        - $ref: "#/components/parameters/WebhookIDHeader"
+        - $ref: "#/components/parameters/WebhookTimestampHeader"
+        - $ref: "#/components/parameters/WebhookSignatureHeader"
+        - name: User-Agent
+          in: header
+          required: true
+          schema: { type: string, example: "Hookrelay/0.1 (+https://github.com/hookrelay/hookrelay)" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "2XX":
+          description: Delivery succeeded.
+        default:
+          description: Any other status (including 3xx), a timeout or a connection error is a failed attempt.
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: "hr_<43 base64url chars>"
+      description: |
+        Project API key, shown once at project creation. Stored only as a SHA-256 hash.
+        Send as `Authorization: Bearer hr_...`.
+    session:
+      type: apiKey
+      in: header
+      name: X-Hookrelay-Session
+      description: |
+        Neon Auth session (the value of the signed session cookie that Neon Auth issues, 1-2048 RFC 6265
+        cookie-octet characters). The Next.js BFF sets it from its encrypted httpOnly `hr_session` cookie.
+        Browsers never send it directly. The API checks it with Neon Auth `GET /get-session`. Positive results
+        are cached for at most `SESSION_CACHE_TTL` (5 s), so a signed-out session stops working within 5 s.
+
+  headers:
+    XRequestId:
+      description: Request correlation ID, also present in server logs.
+      schema: { type: string }
+    IdempotentReplayed:
+      description: Present and `true` when the response was replayed from an earlier request with the same `Idempotency-Key`.
+      schema: { type: string, enum: ["true"] }
+    NoStore:
+      description: Always `no-store`.
+      schema: { type: string, const: no-store }
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Values above 100 return `400 validation_error` (field `limit`).
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`).
+      schema: { type: string, maxLength: 512 }
+    EndpointID:
+      name: endpoint_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/EndpointID" }
+    MessageID:
+      name: message_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/MessageID" }
+    DeliveryID:
+      name: delivery_id
+      in: path
+      required: true
+      schema: { $ref: "#/components/schemas/DeliveryID" }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Client-chosen key, 1 to 255 printable ASCII characters, scoped to the project, valid 24 hours.
+      schema: { type: string, minLength: 1, maxLength: 255, pattern: "^[\\x21-\\x7E]+$" }
+    WebhookIDHeader:
+      name: webhook-id
+      in: header
+      required: true
+      description: The message ID. Stable across retries and replays.
+      schema: { $ref: "#/components/schemas/MessageID" }
+    WebhookTimestampHeader:
+      name: webhook-timestamp
+      in: header
+      required: true
+      description: Unix seconds at send time (fresh for every attempt).
+      schema: { type: string, pattern: "^[0-9]{1,12}$", example: "1762600000" }
+    WebhookSignatureHeader:
+      name: webhook-signature
+      in: header
+      required: true
+      description: Space-separated list of `v1,<base64 signature>`.
+      schema: { type: string, example: "v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=" }
+
+  responses:
+    ValidationError:
+      description: The request is syntactically invalid. `field` names the failing input.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: validation_error, message: "url must be an absolute http(s) URL", field: url } }
+    Unauthorized:
+      description: |
+        No credential, both credentials, or a malformed, unknown, revoked, expired or signed-out API key or
+        session. The body is identical in every case (the message is kept from US-001 for compatibility). Also
+        returned for an invalid webhook signature on the demo receiver.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: unauthorized, message: "missing or invalid API key" } }
+    Forbidden:
+      description: The operation is disabled by configuration.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: forbidden, message: "project creation is disabled on this deployment" } }
+    NotFound:
+      description: The resource does not exist or belongs to another project.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: not_found, message: "endpoint not found" } }
+    Conflict:
+      description: |
+        The request conflicts with current state (limit reached, delivery already pending, endpoint disabled), or
+        `project_not_provisioned` when a verified session has no project yet.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: conflict, message: "endpoint limit of 20 per project reached" } }
+    PayloadTooLarge:
+      description: Request body exceeds 256 KB. Nothing is stored.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: payload_too_large, message: "request body exceeds 262144 bytes" } }
+    IdempotencyKeyMismatch:
+      description: The `Idempotency-Key` was already used within 24 hours with a different request body.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: idempotency_key_mismatch, message: "Idempotency-Key was already used with a different request body" } }
+    ProjectNotProvisioned:
+      description: The session is valid but its user has no project yet. Call `POST /v1/me/project` first.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: project_not_provisioned, message: "project not provisioned for this account yet" } }
+    AuthUnavailable:
+      description: |
+        Session requests only. Neon Auth could not verify the session (timeout, network error, 5xx, unexpected
+        response). The request fails closed and is never treated as authenticated. Safe to retry.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: auth_unavailable, message: "authentication service unavailable, try again" } }
+    Internal:
+      description: Unexpected server error. Never contains internals; correlate with `X-Request-Id`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example: { error: { code: internal, message: "internal server error" } }
+
+  schemas:
+    # ---------- shared ----------
+    Error:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          additionalProperties: false
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            message: { type: string, description: Human readable; safe to show to users. }
+            field:
+              type: string
+              description: Present on `validation_error`; the input that failed (body field, `limit`, `cursor`, `status`, `Idempotency-Key`).
+    ErrorCode:
+      type: string
+      enum:
+        - validation_error
+        - unauthorized
+        - forbidden
+        - not_found
+        - method_not_allowed
+        - conflict
+        - payload_too_large
+        - idempotency_key_mismatch
+        - simulated_failure
+        - project_not_provisioned
+        - auth_unavailable
+        - bad_gateway # BFF only: the dashboard proxy could not reach this API (never returned by the API itself)
+        - internal
+    Timestamp:
+      type: string
+      format: date-time
+      description: RFC 3339, UTC.
+    NextCursor:
+      type: [string, "null"]
+      description: Opaque cursor for the next page; `null` on the last page.
+    ProjectID:
+      type: string
+      pattern: "^proj_[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["proj_01JC3ZK6Q8V2W7T4N5R9XBYH0M"]
+    EndpointID:
+      type: string
+      pattern: "^ep_[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["ep_01JC3ZM2H7Y9D4E6F8G0J1K2M3"]
+    MessageID:
+      type: string
+      pattern: "^msg_[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["msg_01JC3ZP4A5B6C7D8E9F0G1H2J3"]
+    DeliveryID:
+      type: string
+      pattern: "^dlv_[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["dlv_01JC3ZQ8K9M0N1P2Q3R4S5T6V7"]
+    AttemptID:
+      type: string
+      pattern: "^att_[0-9A-HJKMNP-TV-Z]{26}$"
+      examples: ["att_01JC3ZR1W2X3Y4Z5A6B7C8D9E0"]
+
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        checks:
+          type: object
+          required: [database]
+          properties:
+            database: { type: string, enum: [ok, unreachable] }
+
+    # ---------- projects ----------
+    CreateProjectRequest:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: >-
+            Trimmed; must not be empty or whitespace only, and must not contain control
+            characters (Unicode Cc).
+    Project:
+      type: object
+      required: [id, name, created_at, demo_receiver_url]
+      properties:
+        id: { $ref: "#/components/schemas/ProjectID" }
+        name: { type: string }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        demo_receiver_url:
+          type: [string, "null"]
+          format: uri
+          description: |
+            Base URL of the built-in demo receiver for this project (append `?fail_first=N`), or `null` when the
+            demo receiver is disabled on this deployment.
+          examples: ["https://hookrelay.fly.dev/demo/receiver/proj_01JC3ZK6Q8V2W7T4N5R9XBYH0M"]
+    ProjectCreated:
+      allOf:
+        - $ref: "#/components/schemas/Project"
+        - type: object
+          required: [api_key]
+          properties:
+            api_key:
+              type: string
+              pattern: "^hr_[A-Za-z0-9_-]{43}$"
+              description: Shown once. Store it now; it cannot be retrieved again.
+
+    # ---------- endpoints ----------
+    CreateEndpointRequest:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url: { type: string, format: uri, maxLength: 2048 }
+        description: { type: string, maxLength: 255, default: "" }
+    UpdateEndpointRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        url: { type: string, format: uri, maxLength: 2048 }
+        description: { type: string, maxLength: 255 }
+        enabled: { type: boolean }
+    Endpoint:
+      type: object
+      required: [id, url, description, enabled, created_at, updated_at]
+      properties:
+        id: { $ref: "#/components/schemas/EndpointID" }
+        url: { type: string, format: uri }
+        description: { type: string }
+        enabled: { type: boolean }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        updated_at: { $ref: "#/components/schemas/Timestamp" }
+    SigningSecret:
+      type: string
+      pattern: "^whsec_[A-Za-z0-9+/]{43}=$"
+      description: "`whsec_` + standard base64 of 32 random bytes. The HMAC key is the decoded bytes."
+    EndpointWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/Endpoint"
+        - type: object
+          required: [signing_secret]
+          properties:
+            signing_secret: { $ref: "#/components/schemas/SigningSecret" }
+    EndpointSecret:
+      type: object
+      required: [signing_secret]
+      properties:
+        signing_secret: { $ref: "#/components/schemas/SigningSecret" }
+    EndpointList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Endpoint" }
+        next_cursor: { $ref: "#/components/schemas/NextCursor" }
+
+    # ---------- messages ----------
+    EventType:
+      type: string
+      minLength: 1
+      maxLength: 100
+      pattern: "^[A-Za-z0-9._-]+$"
+      examples: ["invoice.paid"]
+    PublishMessageRequest:
+      type: object
+      required: [event_type, payload]
+      additionalProperties: false
+      properties:
+        event_type: { $ref: "#/components/schemas/EventType" }
+        payload:
+          type: object
+          additionalProperties: true
+          description: Any JSON object. Stored and delivered byte-for-byte as sent. Arrays, strings and null are rejected.
+    MessageAccepted:
+      type: object
+      required: [id, event_type, created_at]
+      properties:
+        id: { $ref: "#/components/schemas/MessageID" }
+        event_type: { $ref: "#/components/schemas/EventType" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+    DeliveryCounts:
+      type: object
+      required: [pending, succeeded, failed]
+      properties:
+        pending: { type: integer, minimum: 0 }
+        succeeded: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+    MessageSummary:
+      type: object
+      required: [id, event_type, created_at, delivery_summary]
+      properties:
+        id: { $ref: "#/components/schemas/MessageID" }
+        event_type: { $ref: "#/components/schemas/EventType" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        delivery_summary: { $ref: "#/components/schemas/DeliveryCounts" }
+    MessageList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/MessageSummary" }
+        next_cursor: { $ref: "#/components/schemas/NextCursor" }
+    MessageDetail:
+      type: object
+      required: [id, event_type, created_at, payload, deliveries]
+      properties:
+        id: { $ref: "#/components/schemas/MessageID" }
+        event_type: { $ref: "#/components/schemas/EventType" }
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+        payload:
+          type: object
+          additionalProperties: true
+          description: Exactly as published (raw JSON embedded byte-for-byte).
+        deliveries:
+          type: array
+          items: { $ref: "#/components/schemas/Delivery" }
+
+    # ---------- deliveries ----------
+    DeliveryStatus:
+      type: string
+      enum: [pending, succeeded, failed]
+    Delivery:
+      type: object
+      required: [id, message_id, endpoint_id, status, attempt_count, next_attempt_at, last_attempt_at, created_at]
+      properties:
+        id: { $ref: "#/components/schemas/DeliveryID" }
+        message_id: { $ref: "#/components/schemas/MessageID" }
+        endpoint_id: { $ref: "#/components/schemas/EndpointID" }
+        status: { $ref: "#/components/schemas/DeliveryStatus" }
+        attempt_count: { type: integer, minimum: 0 }
+        next_attempt_at:
+          type: [string, "null"]
+          format: date-time
+          description: When the next attempt is due (or, while an attempt is in flight, when its lease expires). `null` when not `pending`.
+        last_attempt_at:
+          type: [string, "null"]
+          format: date-time
+        created_at: { $ref: "#/components/schemas/Timestamp" }
+    DeliveryList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Delivery" }
+        next_cursor: { $ref: "#/components/schemas/NextCursor" }
+    AttemptError:
+      type: [string, "null"]
+      enum: [timeout, connection_error, dns_error, destination_blocked, endpoint_disabled, null]
+      description: "`null` when the receiver answered with an HTTP status (check `response_status`)."
+    AttemptTrigger:
+      type: string
+      enum: [automatic, manual]
+    Attempt:
+      type: object
+      required:
+        [id, delivery_id, attempt_number, trigger, started_at, duration_ms, response_status, response_body, response_body_truncated, error]
+      properties:
+        id: { $ref: "#/components/schemas/AttemptID" }
+        delivery_id: { $ref: "#/components/schemas/DeliveryID" }
+        attempt_number: { type: integer, minimum: 1 }
+        trigger: { $ref: "#/components/schemas/AttemptTrigger" }
+        started_at: { $ref: "#/components/schemas/Timestamp" }
+        duration_ms: { type: integer, minimum: 0 }
+        response_status:
+          type: [integer, "null"]
+          minimum: 100
+          maximum: 599
+        response_body:
+          type: [string, "null"]
+          maxLength: 4096
+          description: First 4 KB of the response body as UTF-8 (invalid bytes replaced). `null` if there was no response.
+        response_body_truncated: { type: boolean }
+        error: { $ref: "#/components/schemas/AttemptError" }
+    AttemptList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Attempt" }
+        next_cursor: { $ref: "#/components/schemas/NextCursor" }
+
+    # ---------- demo ----------
+    DemoReceiverResult:
+      type: object
+      required: [received, endpoint_id, webhook_id, request_number]
+      properties:
+        received: { type: boolean, const: true }
+        endpoint_id: { $ref: "#/components/schemas/EndpointID" }
+        webhook_id: { $ref: "#/components/schemas/MessageID" }
+        request_number:
+          type: integer
+          minimum: 1
+          description: How many times this (endpoint, webhook-id) pair has hit the receiver, including this request.
