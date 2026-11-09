@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (lint, layers, vuln, test, migrations)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: hookrelay
+          POSTGRES_DB: hookrelay
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum # caches the module and build caches
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: go vet
+        run: go vet -tags integration ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15
+          working-directory: backend
+      - name: Layer rules (dependency rule greps)
+        run: sh scripts/check-layers.sh
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - name: Unit + integration tests (race, -tags integration)
+        # Testcontainers uses the runner's Docker daemon.
+        run: go test -race -count=1 -tags integration -coverprofile=coverage.out ./...
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -trimpath -o bin/hookrelay ./cmd/server
+
+      - name: Migrations up -> down -> up
+        env:
+          DATABASE_URL: postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable
+          SECRET_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: |
+          set -eu
+          n=$(ls migrations/*.up.sql | wc -l)
+          ./bin/hookrelay migrate up
+          i=0; while [ "$i" -lt "$n" ]; do ./bin/hookrelay migrate down; i=$((i+1)); done
+          ./bin/hookrelay migrate up
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: backend/coverage.out
+
+  frontend:
+    name: Frontend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Generated API types are up to date
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/lib/api/schema.d.ts
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    name: E2E (Playwright against docker compose)
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Start the stack
+        run: docker compose up -d --build
+      - name: Wait for api and web
+        run: |
+          for url in http://localhost:8080/healthz http://localhost:3000/; do
+            for i in $(seq 1 60); do
+              curl -fsS "$url" >/dev/null && break
+              [ "$i" -eq 60 ] && { echo "timed out waiting for $url"; docker compose logs; exit 1; }
+              sleep 2
+            done
+          done
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npx playwright test
+        working-directory: frontend
+        env:
+          E2E_BASE_URL: http://localhost:3000
+      - name: Compose logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
+          if-no-files-found: ignore
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
+
+  deploy:
+    name: Deploy backend to Fly.io
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # Secrets (DATABASE_URL, SECRET_ENCRYPTION_KEY, ...) are stored in Fly, not here.
+      - name: fly deploy
+        working-directory: backend
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

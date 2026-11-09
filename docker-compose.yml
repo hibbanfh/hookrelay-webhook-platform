@@ -1,0 +1,105 @@
+# Local stack: postgres -> migrate (one-shot) -> seed (one-shot) -> api + worker -> web.
+# `make dev` runs this. Every value below has a development-only default, so no .env
+# is required; copy .env.example to .env to override. Never reuse these defaults in production.
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  DATABASE_URL: postgres://hookrelay:hookrelay@postgres:5432/hookrelay?sslmode=disable
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+  # Must be reachable from the worker container, hence the service name.
+  DEMO_RECEIVER_BASE_URL: ${DEMO_RECEIVER_BASE_URL:-http://api:8080/demo/receiver}
+  SECRET_ENCRYPTION_KEY: ${SECRET_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+  SEED_DEMO_API_KEY: ${SEED_DEMO_API_KEY:-hr_demo_key_local_only_not_a_real_secret_00000}
+  SEED_DEMO_PROJECT_NAME: ${SEED_DEMO_PROJECT_NAME:-Hookrelay Demo}
+  PROJECT_CREATION_ENABLED: ${PROJECT_CREATION_ENABLED:-true}
+  RETRY_SCHEDULE: ${RETRY_SCHEDULE:-5s,30s,2m,15m,1h}
+
+x-backend: &backend
+  build:
+    context: ./backend
+  image: hookrelay-backend:local
+  environment: *backend-env
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hookrelay
+      POSTGRES_PASSWORD: hookrelay
+      POSTGRES_DB: hookrelay
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookrelay -d hookrelay"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *backend
+    command: ["/hookrelay", "migrate", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  seed:
+    <<: *backend
+    command: ["/hookrelay", "seed"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    <<: *backend
+    command: ["/hookrelay", "api"]
+    environment:
+      <<: *backend-env
+      HTTP_ADDR: ":8080"
+      # Dashboard sessions (US-025, ADR 0011). Empty base URL = no dashboard sign-in (fail closed).
+      NEON_AUTH_BASE_URL: ${NEON_AUTH_BASE_URL:-}
+      NEON_AUTH_SESSION_COOKIE: ${NEON_AUTH_SESSION_COOKIE:-__Secure-neon-auth.session_token}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+      NEON_AUTH_TIMEOUT: ${NEON_AUTH_TIMEOUT:-3s}
+      SESSION_CACHE_TTL: ${SESSION_CACHE_TTL:-5s}
+    ports:
+      - "8080:8080"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  worker:
+    <<: *backend
+    command: ["/hookrelay", "worker"]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  web:
+    build:
+      context: ./frontend
+    image: hookrelay-web:local
+    environment:
+      API_INTERNAL_URL: http://api:8080
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-change-me-0123456789}
+      NEON_AUTH_BASE_URL: ${NEON_AUTH_BASE_URL:-}
+      NEON_AUTH_SESSION_COOKIE: ${NEON_AUTH_SESSION_COOKIE:-__Secure-neon-auth.session_token}
+      DASHBOARD_ORIGIN: ${DASHBOARD_ORIGIN:-http://localhost:3000}
+      # Local compose runs the production build over http; real deployments must use https.
+      ALLOW_INSECURE_SESSION_COOKIE: ${ALLOW_INSECURE_SESSION_COOKIE:-1}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
