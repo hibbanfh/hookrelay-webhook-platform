@@ -25,7 +25,7 @@
 | **Delivery p95 < 2 s** | Worker polls every 500 ms and re-polls immediately when a batch was full. The HTTP call runs outside any DB transaction. |
 | **Secure by default** | Hashed API keys and encrypted signing secrets (ADR 0004), HMAC signatures (ADR 0007), SSRF guard at registration *and* dial time (ADR 0003), project isolation enforced in SQL and with composite foreign keys (§7.3). |
 | **Observable** | Every attempt is persisted with status, latency, body snippet and error class. Structured logs carry request, delivery and attempt IDs (§12). |
-| **Explainable** | Clean Architecture per domain, one use case per endpoint, eleven ADRs, and every trade-off written down. |
+| **Explainable** | Clean Architecture per domain, one use case per endpoint, twelve ADRs, and every trade-off written down. |
 
 Non-goals that shape the design: no exactly-once, no FIFO per endpoint, no teams or multiple
 projects per user (one Neon Auth user owns one project, US-025), no payload transformations (PRD §5).
@@ -111,12 +111,13 @@ flowchart TB
     dr --> dm
     ds --> dm
     dx -.->|implements ports| de
-    main["cmd/server (wiring + cross-domain adapters)"] --> dp & dw & dr & ds & dx & uc
-    platform["internal/platform<br/>config · logging · postgres · httpx · netguard · crypto · ids · clock · auth"]
+    main["cmd/server + wire (composition root, cross-domain adapters)"] --> dp & dw & dr & ds & dx & uc
+    platform["internal/platform<br/>config · httpx · auth · health"]
+    library["internal/library (one package per dependency)<br/>postgres · clock · ids · random · logger · httpclient · secretbox · netguard"]
     dp --> platform
-    ds --> platform
-    dx --> platform
+    ds --> library
     main --> platform
+    main --> library
 ```
 
 **Dependency rule:** `delivery -> usecase -> domain <- data`. Imports only point inward. Inside a
@@ -129,18 +130,19 @@ module the rule is applied per sub-package (ADR 0010):
 | `domain/repository` | `domain/entity`, `domain/errors` |
 | `domain/usecase` | `domain/entity`, `domain/errors`, `domain/repository` |
 | `data/model` | nothing |
-| `data/source` | `data/model`, `pgx`, `platform/*` |
+| `data/source` | `data/model`, `pgx`, `library/postgres` |
 | `data/repository` | `data/source`, `data/model`, `domain/entity`, `domain/errors`, `domain/repository` |
 | `delivery/dto` | `domain/entity` at most (prefer nothing) |
 | `delivery/presenter/http` | `delivery/dto`, `domain/usecase`, `domain/entity`, `domain/errors`, `platform/httpx`, `platform/auth` |
 
 - `domain/*` never imports `net/http`, `pgx`, `sqlc`, `slog` or anything outside `domain/*`.
-- **Nothing imports `data/*` or `delivery/presenter` except `cmd/server` wiring** (and `data/*`
-  itself). In particular `delivery` never imports `data`, and `data` never imports `usecase` or
-  `delivery`.
-- `platform` never imports a domain.
+- **Nothing imports `data/*` or `delivery/presenter` except the composition root** (`cmd/server`
+  and `backend/wire`, ADR 0012) and `data/*` itself. In particular `delivery` never imports `data`,
+  and `data` never imports `usecase` or `delivery`.
+- `platform` and `library` never import a domain. A library never imports `platform` or another
+  library. It satisfies domain ports structurally, and every `wire.Bind` lives in `backend/wire`.
 - **A module never imports another module.** Cross-module calls go through ports declared by
-  the *caller* and implemented in `cmd/server/adapters.go` by calling the provider's use case
+  the *caller* and implemented in `backend/wire/adapters.go` by calling the provider's use case
   (ADR 0005).
 - Enforced by `depguard` in `backend/.golangci.yml` and by `backend/scripts/check-layers.sh`
   (`make lint-layers`, run in CI). Both were proven by planting a violation per rule.
@@ -153,24 +155,32 @@ backend/
   sqlc.yaml                      # one sqlc package per domain: internal/<d>/data/source (sqlcgen output, later)
   cmd/server/
     main.go                      # subcommand dispatch only: api | worker | migrate | seed
-    api.go  worker.go  migrate.go  seed.go   # per-process wiring (explicit, no DI framework)
+    api.go  worker.go  seed.go   # each calls its Wire injector once, then runs
+    migrate.go                   # direct call, no object graph
+  wire/                          # composition root (ADR 0012)
+    wire.go                      # injectors (build tag wireinject)
+    wire_gen.go                  # generated and committed; CI checks it is current
+    <module>.go                  # provider set and wire.Bind per module
+    router.go  options.go        # middleware chain + routes; config -> library Options
     adapters.go                  # cross-domain port adapters (the only place that sees 2 domains)
   migrations/
     embed.go                     # //go:embed *.sql, used by `hookrelay migrate`
     0001_projects.up.sql / .down.sql   ... (see §7.5)
   internal/
+    library/       # one package per dependency, each with a Wire ProviderSet (ADR 0012)
+      postgres/    # pgxpool constructor, migrations, TxManager, Executor(ctx)
+      clock/       # system clock
+      ids/         # prefixed ULID generator (monotonic)
+      random/      # crypto/rand RandomSource, jitter source
+      logger/      # slog JSON handler
+      httpclient/  # outbound http.Client with timeout and no redirects
+      secretbox/   # AES-256-GCM seal/open (signing secrets at rest)
+      netguard/    # SSRF policy (ranges, URL rules), resolver, allowlist; guarded DialContext in US-004
     platform/
       config/      # env parsing + validation (fail fast), typed Config struct
-      logging/     # slog JSON handler, redaction helpers
-      postgres/    # pgxpool constructor, TxManager, Executor(ctx), pg error helpers
       httpx/       # DecodeJSON (strict), WriteJSON, WriteError, Error type, cursor codec,
                    # middleware: RequestID, AccessLog, Recover, BodyLimit, Timeout; Chain; JSON 404/405
       auth/        # WithProjectID(ctx) / ProjectID(ctx): auth context only
-      netguard/    # SSRF policy (ranges, URL rules), guarded DialContext, allowlist
-      crypto/      # AES-256-GCM Cipher (signing secrets at rest)
-      ids/         # prefixed ULID generator (monotonic)
-      clock/       # system clock
-      random/      # crypto/rand RandomSource, jitter source
       health/      # GET /healthz handler (DB ping, 1 s timeout)
     <module>/      # project, endpoint, message, dispatch, demoreceiver: all share this shape (ADR 0010)
       domain/
@@ -196,8 +206,8 @@ directory name would clash (`domainerrors`, `repositoryimpl`, `httppresenter`). 
 in `domain/usecase/`. Repository ports live in `domain/repository/`; other outbound ports
 (cross-module, sender) get their own file next to them. SQL lives only in `data/source`.
 Model-to-entity mapping lives in `data/repository`, so `domain/entity` never imports `data/model`
-(ADR 0010 explains why there is no `entity.FromModel`). Only `cmd/server` imports `data/*` and
-`delivery/presenter`.
+(ADR 0010 explains why there is no `entity.FromModel`). Only the composition root (`cmd/server`,
+`backend/wire`) imports `data/*` and `delivery/presenter`.
 
 ### 4.3 Shared HTTP concerns
 
@@ -233,8 +243,8 @@ Model-to-entity mapping lives in `data/repository`, so `domain/entity` never imp
 - **IDs:** `prefix_` + ULID (26 chars, Crockford base32, monotonic per process) from
   `platform/ids`, stored as `text` with a `CHECK (id LIKE 'ep\_%')`. The prefix makes IDs
   self-describing in logs. ULIDs sort by time, which keeps B-tree inserts append-mostly.
-- **JSON decoding:** `DisallowUnknownFields`, a single top-level value, and `null` treated as
-  omitted for optional PATCH fields.
+- **JSON decoding:** `DisallowUnknownFields` and a single top-level value. In PATCH bodies an
+  absent field is unchanged and an explicit `null` is a `400` (`docs/plans/us-002.md` section 5).
 
 ## 5. Domains, ports and use cases
 
@@ -269,19 +279,19 @@ domain's port or a CLI command.
 
 | Kind | Name | Notes |
 |---|---|---|
-| Entity | `Endpoint{ID, ProjectID, URL, Description, Enabled, Secret, CreatedAt, UpdatedAt}` | `NewEndpoint` validates an absolute http(s) URL ≤ 2048 chars and a description ≤ 255. `ApplyPatch(Patch, now)` re-validates |
+| Entity | `Endpoint{ID, ProjectID, URL, Description, Enabled, CreatedAt, UpdatedAt}` | No secret field, so reads cannot leak it. `NewEndpoint` validates an absolute http(s) URL ≤ 2048 chars and a description ≤ 255. `ApplyPatch(Patch, now)` re-validates |
 | Value | `SigningSecret` | `NewSigningSecret(32 random bytes)`, `String()` renders `whsec_<b64>`, `LogValue()` redacts |
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrLimitReached` (409, message names the limit) | |
-| Port | `Repository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` takes `pg_advisory_xact_lock(hashtext(project_id))` and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
-| Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `crypto.Cipher` in the adapter |
+| Port | `EndpointRepository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` locks the `projects` row `FOR NO KEY UPDATE`, then counts in a second statement, and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
+| Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox` |
 | Port | `Directory{ListEnabledIDs, GetTargets, GetState}` | system reads for other domains |
-| Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `platform/netguard`. Returns `ValidationError{Field:"url"}` |
+| Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `library/netguard`. Non-nil means rejected; the use case converts it to `ValidationError{Field:"url"}` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `RandomSource`, `TxManager` | |
 | Use case | `CreateEndpoint` | `POST /v1/endpoints`. Flow: entity → URLPolicy → tx{CountForUpdate ≥ limit → `ErrLimitReached`; Create} |
 | Use case | `ListEndpoints` | `GET /v1/endpoints` |
 | Use case | `GetEndpoint` | `GET /v1/endpoints/{id}` |
 | Use case | `GetEndpointSecret` | `GET /v1/endpoints/{id}/secret` |
-| Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (only if the URL changed) → UpdateFields |
+| Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (whenever `url` is present) → UpdateFields |
 | Use case | `ListEnabledEndpointIDs` | internal, used by `message.EndpointDirectory` (US-003) |
 | Use case | `GetDeliveryTargets` | internal, batch `{url, secret, enabled}` by IDs for `dispatch.EndpointCatalog` (US-004) |
 | Use case | `GetEndpointState` | internal, `{enabled}` scoped by project, or `ErrNotFound` (US-006/US-007) |
@@ -343,7 +353,7 @@ domain's port or a CLI command.
 | Ports (usecase) | `Clock` | 5-minute timestamp tolerance |
 | Use case | `ReceiveWebhook` | `POST /demo/receiver/{project_id}?fail_first=N` |
 
-### 5.6 Cross-domain adapter map (`cmd/server/adapters.go`)
+### 5.6 Cross-domain adapter map (`backend/wire/adapters.go`)
 
 | Consumer port | Implemented by calling | Used in |
 |---|---|---|
@@ -781,7 +791,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 |---|---|
 | Message + deliveries atomic | Single tx via `TxManager`; repositories join the tx from ctx (ADR 0005) |
 | Duplicate publish | `Idempotency-Key` PK `(project_id, key)` and fingerprint compare; insert blocks on the unique index under concurrency |
-| Endpoint limit race (20/project) | `pg_advisory_xact_lock(hashtext(project_id))` + count + insert in one tx |
+| Endpoint limit race (20/project) | Lock the `projects` row `FOR NO KEY UPDATE`, then count, then insert, as separate statements in one tx (`docs/plans/us-002.md` section 4) |
 | Concurrent PATCH | Per-field `COALESCE` update. The last writer wins per field, never across fields |
 | Two workers, one row | `FOR UPDATE SKIP LOCKED` claim plus a lease in `next_attempt_at` |
 | Worker crash | Lease expiry → row is due again. No in-memory state |
@@ -848,7 +858,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 
 ## 13. Observability
 
-- **Logs** (`log/slog` JSON, one handler from `platform/logging`):
+- **Logs** (`log/slog` JSON, one handler from `library/logger`):
   - API access log, one line per request: `request_id`, `method`, `route` (Go 1.23
     `r.Pattern`), `path`, `status`, `duration_ms`, `project_id` (when authenticated),
     `bytes_out`. Request ID comes from `X-Request-Id` (if 1-64 safe chars) or is a new ULID, and
@@ -986,12 +996,9 @@ Migration `0002_projects_neon_user_id`.
 5. `cmd/server/api.go`: pass `cfg.ProjectCreationEnabled`.
 
 ### US-002: Endpoints
-1. `endpoint/domain`: `endpoint.go` (`NewEndpoint`, `ApplyPatch`, `Patch{URL, Description *string; Enabled *bool}`), `secret.go` (`SigningSecret`), `errors.go` (`ErrNotFound`, `ErrInvalid`, `ValidationError`, `ErrLimitReached`), `repository.go` (`Repository`, `SecretReader`; `Directory` grows in later stories), `ports.go` (`URLPolicy`).
-2. `platform/netguard`: `ranges.go` (prefix table), `policy.go` (`Policy.Check(ctx, url)` with mode, resolver, allowlist, allowlist-only). Table tests include every range, IPv4-mapped IPv6, userinfo and DNS-to-private via a fake resolver. `platform/crypto/cipher.go` (AES-GCM, AAD, key versions).
-3. `endpoint/usecase`: `create_endpoint.go`, `list_endpoints.go`, `get_endpoint.go`, `get_endpoint_secret.go`, `update_endpoint.go`. Tests cover the limit (19 → ok, 20 → `ErrLimitReached`), policy rejection, patch re-validation, not-found.
-4. `migrations/0003_endpoints`. `endpoint/data/postgres`: queries `CreateEndpoint`, `GetEndpoint`, `GetEndpointSecret`, `ListEndpoints` (keyset), `UpdateEndpointFields` (COALESCE), `CountEndpointsForUpdate` (advisory lock). Repository decrypts and encrypts via `Cipher`. Integration tests cover the limit under 5 concurrent creates and verify the ciphertext isn't the plaintext.
-5. `endpoint/delivery/http`: DTOs (list item has **no** `signing_secret`), handlers `Create`, `List`, `Get`, `GetSecret` (`Cache-Control: no-store`), `Update`; routes; errors table (`ErrLimitReached` → 409).
-6. Wiring: `netguard.Policy` adapter as `URLPolicy`, cipher, `cfg.MaxEndpointsPerProject`.
+Full layer-ordered plan, SSRF rules, PATCH semantics and test strategy: [`docs/plans/us-002.md`](plans/us-002.md).
+The Wire and library migration (ADR 0012) lands first as a behaviour-preserving step. Use cases:
+`CreateEndpoint`, `ListEndpoints`, `GetEndpoint`, `GetEndpointSecret`, `UpdateEndpoint`. Migration `0003_endpoints`.
 
 ### US-003: Publish
 1. `message/domain`: `message.go`, `idempotency.go` (`IdempotencyKey`, `Fingerprint`, `Reservation`, `Record`), `errors.go` (`ErrIdempotencyMismatch`), `repository.go` (`Repository{Create, Get, List, GetMany}`, `IdempotencyStore{Reserve, Find}`), `ports.go` (`EndpointDirectory`, `DeliveryScheduler`).
@@ -1007,7 +1014,7 @@ Migration `0002_projects_neon_user_id`.
 2. `dispatch/usecase`: `claim_due_deliveries.go`, `attempt_delivery.go`. Tests use a fake sender and clock: disabled → no send + `endpoint_disabled`; blocked → failed; 2xx → succeeded; headers and signature correct; lease lost is surfaced.
 3. `endpoint/usecase/get_delivery_targets.go`, `message/usecase/get_message_payloads.go` (+ repo methods).
 4. `migrations/0006_attempts`. `dispatch/data/postgres`: claim and complete queries. Integration tests: two concurrent claimers get disjoint rows; expired lease is reclaimed; stale completion → `ErrLeaseLost`.
-5. `platform/netguard/dialer.go` (guarded `DialContext` + `Control`). `dispatch/data/webhookhttp/sender.go`: client, headers, 4 KB read, error classification. Tests cover 3xx, timeout, 1 MB body, blocked IP.
+5. `library/netguard/dialer.go` (guarded `DialContext` + `Control`). `dispatch/data/webhookhttp/sender.go`: client, headers, 4 KB read, error classification. Tests cover 3xx, timeout, 1 MB body, blocked IP.
 6. `dispatch/delivery/worker/runner.go`: loop, free-slot claiming, errgroup, drain context, backoff on DB errors, health heartbeat.
 7. Wiring: `cmd/server/worker.go` (sender only built here), adapters `endpointCatalog`, `messageCatalog`. System test: 2 runners × 500 messages.
 

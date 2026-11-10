@@ -1,6 +1,6 @@
 # ADR 0005: Clean Architecture per domain, caller-owned cross-domain ports, manual dependency injection
 
-- **Status:** Accepted, partially superseded by [0010](0010-per-concern-sub-packages-per-module.md) (the per-module directory layout; the dependency rule, cross-domain ports, unit of work and manual DI stand)
+- **Status:** Accepted, partially superseded by [0010](0010-per-concern-sub-packages-per-module.md) (the per-module directory layout) and [0012](0012-google-wire-and-per-dependency-libraries.md) (manual DI is replaced by Wire; `cmd/server/adapters.go` becomes `backend/wire/adapters.go`; `internal/platform/postgres` becomes `internal/library/postgres`). The dependency rule, cross-domain ports and unit of work stand.
 - **Date:** 2026-11-08
 
 ## Context

@@ -5,6 +5,10 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- US-002: register and manage endpoints.
+  - `POST/GET /v1/endpoints`, `GET/PATCH /v1/endpoints/{id}`, `GET /v1/endpoints/{id}/secret`: per-endpoint `whsec_` signing secret (AES-256-GCM at rest, AAD = endpoint ID), keyset pagination, PATCH that tells absent from `null`, `404` across projects (API key and session), `409` naming `MAX_ENDPOINTS_PER_PROJECT` that holds under concurrent creates (project row lock), migration 0003.
+  - Production SSRF check at registration (`library/netguard`): https only, name deny-list, numeric hosts, every blocked IPv4/IPv6 range including IPv4-mapped and transition forms, all DNS answers checked, fail closed, allowlist. Delivery-time dial guard stays in US-004.
+- Refactor (ADR 0012): object graph built with Google Wire in `backend/wire` (`wire_gen.go` committed, `make wire` / `make wire-check`, CI step); `internal/platform/{postgres,clock,ids,random,logging}` became `internal/library/{postgres,clock,ids,random,logger}` plus `httpclient`, `secretbox`, `netguard`; new depguard and `check-layers.sh` rules.
 - US-025: sign up / sign in with Neon Auth (managed Better Auth) and session verification (ADR 0011, supersedes ADR 0008).
   - Go: `RequireProject` middleware accepts a Bearer API key or a Neon session (`X-Hookrelay-Session`), verified against Neon `get-session` with a 5 s positive cache (singleflight), fail-closed `503 auth_unavailable`; `POST /v1/me/project` provisions one project per user (race-safe via `projects.neon_user_id` unique, migration 0002) and returns the API key once.
   - Next.js: `/sign-up`, `/sign-in`, sign-out, server-side BFF routes that keep the Neon session in an encrypted httpOnly `hr_session` cookie, `/api/v1/*` proxy with Origin checks, route-protecting middleware, one-time API key dialog.
@@ -27,4 +31,4 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 
 ### Known gaps
 - Sign-in/sign-out Playwright test in `frontend/e2e/auth.spec.ts` (`E2E_NEON=1`) has not been run.
-- US-025 criterion 14 (cross-user endpoint, message and delivery isolation) waits for those routes (US-002, US-003, US-006).
+- US-025 criterion 14: cross-user endpoint isolation is covered since US-002; message and delivery isolation waits for US-003 and US-006.

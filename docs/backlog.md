@@ -190,7 +190,9 @@ Notes / out of scope:
 
 ---
 
-### US-002: Register and manage endpoints            [status: todo]  [priority: P0]
+### US-002: Register and manage endpoints            [status: done]  [priority: P0]
+
+> **Done 2026-11-10.** All 10 criteria PASS on the real binary against real PostgreSQL (development and production modes, SSRF end to end with real DNS), plus unit, integration and `go test -race` (Linux container). BUG-QA-011/012/013 fixed. Review approved after one round. Known gap: the five use cases and the endpoint data layer were written before their tests (see `docs/test-plan.md`).
 As a platform developer, I want to register receiver URLs, each with its own signing secret,
 so that Hookrelay knows where to deliver my events and receivers can verify them.
 
@@ -600,3 +602,23 @@ multi-language SDKs. See `docs/PRD.md` section 5.
 - **Repro:** `POST /v1/projects` with a body file containing the raw byte `0xFF` inside `name`. Expected `400`, field `name`. Actual `201`, name stored with U+FFFD.
 - **Cause:** `encoding/json` replaces invalid UTF-8 with U+FFFD while decoding, so the `utf8.ValidString` guard could never fire over HTTP. The entity test passed because it called `NewProject` directly with the raw byte.
 - **Test:** `TestCreateProjectRejectsControlCharacters` (invalid byte, truncated sequence, replacement character), `TestNewProject`.
+
+### BUG-QA-011: invalid UTF-8 in an endpoint `url` returns 201 and stores U+FFFD (US-002)   [minor]
+- **Steps:** `POST /v1/endpoints` with a body file containing `{"url":"https://example.com/<0xFF>"}` (raw byte).
+- **Expected:** `400 validation_error`, field `url`. **Actual:** `201`, stored and echoed URL is `https://example.com/�`; the receiver URL is silently not what the client sent. `description` handles the same input correctly (400).
+- **Cause:** same class as BUG-QA-010. `encoding/json` replaces the byte with U+FFFD before `NewEndpoint` runs, so the UTF-8 guard never fires over HTTP. Reject U+FFFD in `url` as `NewProject` does.
+- **Suspected area:** `endpoint/domain/entity` URL validation; add an HTTP-level test with a raw byte.
+- **Fixed in:** `endpoint/domain/entity/endpoint_validation.go` (U+FFFD rejected). Tests: `TestNewEndpoint` row, and the raw `0xFF` body in `wire/endpoint_integration_test.go` (`testValidation`).
+
+### BUG-QA-012: IPv4-translated IPv6 literals (`::ffff:0:0/96`, SIIT) pass the production SSRF check (US-002)   [major]
+- **Steps:** `APP_ENV=production`, `POST /v1/endpoints` with `{"url":"https://[::ffff:0:7f00:1]/x"}` or `https://[::ffff:0:127.0.0.1]/x`.
+- **Expected:** `400 validation_error`, field `url` (it embeds loopback, like `::ffff:7f00:1` and `64:ff9b::7f00:1`, which are rejected). **Actual:** `201`, URL stored.
+- **Impact:** a host with a SIIT/NAT64 translator on its egress path would reach 127.0.0.1 or private space. Not exploitable on a plain dual-stack host, but ADR 0003 and the plan say every IPv6 form that can embed a private IPv4 must be blocked.
+- **Suspected area:** `library/netguard/ranges.go`: add `::ffff:0:0/96` to the blocked ranges (and a table test row). Consider also unmapping/checking embedded IPv4 for any range that carries one.
+- **Fixed in:** `library/netguard/ranges.go` adds `::ffff:0:0:0/96`. The SIIT prefix is `::ffff:0:0:0/96`; the `::ffff:0:0/96` in the report is the IPv4-mapped range, which is already unmapped and judged as IPv4 before the range check. Tests: two rows in `TestProductionRejectsNonPublicDestinations`. ADR 0003 range list updated.
+
+### BUG-QA-013: URL port 0, above 65535 or empty is accepted (US-002)   [minor]
+- **Steps:** `POST /v1/endpoints` with `https://example.com:0/x`, `https://example.com:65536/x`, `https://example.com:99999/x`, `https://example.com:/x`.
+- **Expected:** `400 validation_error`, field `url`. **Actual:** `201` in development and production (production resolves the host and ignores the port). Every delivery to such a URL fails later.
+- **Suspected area:** `endpoint/domain/entity` URL validation (`url.Port()` is only checked to be numeric by `net/url`); require 1..65535 when present.
+- **Fixed in:** `endpoint/domain/entity/endpoint_validation.go` (`hasValidPort`, both modes). Tests: port 0, 65536, 99999, empty (IPv4 host and IPv6) and 1 / 65535 rows in `TestNewEndpoint`.
