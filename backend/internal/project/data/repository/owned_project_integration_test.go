@@ -11,9 +11,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"hookrelay/internal/platform/clock"
-	"hookrelay/internal/platform/ids"
-	"hookrelay/internal/platform/random"
+	"hookrelay/internal/library/clock"
+	"hookrelay/internal/library/ids"
+	"hookrelay/internal/library/random"
 	repositoryimpl "hookrelay/internal/project/data/repository"
 	"hookrelay/internal/project/data/source"
 	"hookrelay/internal/project/domain/entity"

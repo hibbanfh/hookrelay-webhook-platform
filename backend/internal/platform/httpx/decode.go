@@ -17,6 +17,16 @@ var errInvalidJSON = &Error{
 // fields and trailing data are rejected. A body-size violation is returned unchanged so
 // Responder.Error can answer 413.
 func DecodeJSON(r *http.Request, dst any) error {
+	return decodeJSON(r, dst, func(error) error { return errInvalidJSON })
+}
+
+// DecodeJSONNamingFields is DecodeJSON, except that a value of the wrong JSON type is reported
+// as a 400 on that field (`{"url":123}` names url), so the client knows which one to fix.
+func DecodeJSONNamingFields(r *http.Request, dst any) error {
+	return decodeJSON(r, dst, namedTypeFailure)
+}
+
+func decodeJSON(r *http.Request, dst any, fail func(error) error) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	err := dec.Decode(dst)
@@ -25,7 +35,7 @@ func DecodeJSON(r *http.Request, dst any) error {
 		return err
 	}
 	if err != nil {
-		return errInvalidJSON
+		return fail(err)
 	}
 	_, err = dec.Token()
 	if errors.As(err, &tooLarge) {
@@ -35,4 +45,15 @@ func DecodeJSON(r *http.Request, dst any) error {
 		return errInvalidJSON
 	}
 	return nil
+}
+
+func namedTypeFailure(err error) error {
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) || typeErr.Field == "" {
+		return errInvalidJSON
+	}
+	return &Error{
+		Status: http.StatusBadRequest, Code: CodeValidation,
+		Message: typeErr.Field + " has the wrong type", Field: typeErr.Field,
+	}
 }

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"hookrelay/internal/platform/config"
-	"hookrelay/internal/platform/logging"
 )
 
 const (
@@ -18,17 +17,10 @@ const (
 	readTimeout       = 15 * time.Second
 	writeTimeout      = 20 * time.Second
 	idleTimeout       = 120 * time.Second
-	apiShutdownGrace  = 25 * time.Second
 )
 
-// loadConfig reads the environment and returns the config plus a process logger.
-func loadConfig(process string) (config.Config, *slog.Logger, error) {
-	cfg, err := config.Load(os.Getenv)
-	if err != nil {
-		return config.Config{}, nil, err
-	}
-	return cfg, logging.New(os.Stdout, cfg.LogLevel, process), nil
-}
+// loadConfig reads and validates the environment. Wire builds the process logger.
+func loadConfig() (config.Config, error) { return config.Load(os.Getenv) }
 
 // serve runs srv until ctx is cancelled, then shuts it down gracefully.
 func serve(ctx context.Context, srv *http.Server, grace time.Duration, log *slog.Logger) error {

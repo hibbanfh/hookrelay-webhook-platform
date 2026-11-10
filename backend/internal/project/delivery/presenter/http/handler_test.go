@@ -15,11 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"hookrelay/internal/platform/clock"
+	"hookrelay/internal/library/clock"
+	"hookrelay/internal/library/ids"
+	"hookrelay/internal/library/logger"
+	"hookrelay/internal/library/random"
 	"hookrelay/internal/platform/httpx"
-	"hookrelay/internal/platform/ids"
-	"hookrelay/internal/platform/logging"
-	"hookrelay/internal/platform/random"
 	httppresenter "hookrelay/internal/project/delivery/presenter/http"
 	"hookrelay/internal/project/domain/entity"
 	domainerrors "hookrelay/internal/project/domain/errors"
@@ -637,7 +637,7 @@ func TestPlaintextKeyIsNeverStoredOrLogged(t *testing.T) {
 	idgen := ids.NewGenerator(clk, ids.CryptoEntropy)
 	deps := usecase.Deps{Projects: repo, IDs: idgen, Clock: clk, Random: random.Crypto{}}
 	var logs bytes.Buffer
-	log := logging.New(&logs, slog.LevelDebug, "test")
+	log := logger.New(&logs, slog.LevelDebug, "test")
 	resp := httpx.NewResponder(log)
 	h := httppresenter.NewHandler(usecase.NewCreateProject(deps, true), usecase.NewGetCurrentProject(repo), resp, "")
 	mux := http.NewServeMux()
