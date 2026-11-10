@@ -17,12 +17,14 @@ Depth over breadth: a small scope done to production quality beats many half-don
 ```
 api/openapi.yaml          # API contract
 backend/
-  cmd/server/main.go      # entrypoint, wiring only
+  cmd/server/main.go      # entrypoint, subcommand dispatch only
+  wire/                   # composition root: wire.go (injectors), wire_gen.go (generated, committed), provider sets (ADR 0012)
   internal/<module>/      # Clean Architecture per module, one sub-package per concern:
     domain/{entity,errors,repository,usecase}   # stdlib only; one use case per file
     data/{model,source,repository}              # model=rows, source=SQL (pgx), repository=impl + mapping
     delivery/{dto,presenter/http}               # request/response structs, handlers/routes
-  internal/platform/      # db, config, logging, middleware, httpx
+  internal/library/       # one package per dependency, each with a Wire ProviderSet: postgres, clock, ids, random, logger, httpclient, secretbox, netguard
+  internal/platform/      # config, httpx (middleware), auth context, health
   migrations/
 frontend/                 # Next.js app
 docs/

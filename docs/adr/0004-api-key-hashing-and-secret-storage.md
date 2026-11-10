@@ -1,6 +1,6 @@
 # ADR 0004: Hash API keys with SHA-256; encrypt signing secrets with AES-256-GCM
 
-- **Status:** Accepted
+- **Status:** Accepted. Amended 2026-11-09 for US-002: the cipher is `internal/library/secretbox` ([ADR 0012](0012-google-wire-and-per-dependency-libraries.md)), reached through the `SecretCipher` port by `endpoint/data/repository`, and `secret_key_version` is derived from the key (see [`docs/plans/us-002.md`](../plans/us-002.md) section 4).
 - **Date:** 2026-11-08
 
 ## Context
@@ -42,13 +42,18 @@ There are two kinds of secrets with opposite requirements:
   be swapped between endpoints.
 - The key comes from `SECRET_ENCRYPTION_KEY` (base64, 32 bytes) in Fly secrets or `.env`.
   Startup fails if it is missing or the wrong length. `SECRET_ENCRYPTION_KEY_PREVIOUS` (optional)
-  allows key rotation: decrypt with the version-matched key, re-encrypt on the next write. A
-  bulk re-encryption command can come later.
-- Encryption and decryption live in the **data adapter**. `endpoint/data/postgres` gets a
-  `platform/crypto.Cipher` injected, so entities and use cases only see the plaintext
+  lets the server open rows sealed with the old key while new rows use the new one. **Nothing
+  re-seals an existing row yet** (PATCH does not touch the secret), so a rotation is only safe in
+  two steps: set the new key and keep the old one as `SECRET_ENCRYPTION_KEY_PREVIOUS`, then run a
+  re-seal job over every row **before** dropping `SECRET_ENCRYPTION_KEY_PREVIOUS`. Dropping it
+  earlier, or rotating a second time first, makes the remaining secrets unrecoverable. The re-seal
+  job is future work and is not built in US-002; until it exists, treat a key change as a
+  create-new-endpoints event. The runbook must carry this warning.
+- Encryption and decryption live in the **data adapter**: `endpoint/data/repository` calls a
+  `SecretCipher` port (implemented by `library/secretbox`), so entities and use cases only see the plaintext
   `SigningSecret` value type. List queries never select the ciphertext column.
 - `GET .../secret` responds with `Cache-Control: no-store`. Secrets are never logged. The
-  `SigningSecret` type implements `String()` and `LogValue()` as `whsec_****`, so accidental
+  `SigningSecret` type redacts itself as `whsec_****` in every fmt verb, JSON and slog output (it has `MarshalText`, not `LogValue`: the domain cannot import slog), so accidental
   logging is redacted.
 
 ## Alternatives considered

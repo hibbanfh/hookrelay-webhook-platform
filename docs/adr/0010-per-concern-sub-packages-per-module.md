@@ -1,6 +1,6 @@
 # ADR 0010: One Go package per concern inside each module
 
-- **Status:** Accepted. Amends the directory layout of [ADR 0005](0005-clean-architecture-and-manual-di.md), which is partially superseded. The dependency rule (`delivery -> usecase -> domain <- data`), caller-owned cross-module ports, the context-carried unit of work and manual dependency injection from ADR 0005 stay in force.
+- **Status:** Accepted. Amends the directory layout of [ADR 0005](0005-clean-architecture-and-manual-di.md), which is partially superseded. The dependency rule (`delivery -> usecase -> domain <- data`), caller-owned cross-module ports, and the context-carried unit of work from ADR 0005 stay in force. Manual dependency injection was later replaced by [ADR 0012](0012-google-wire-and-per-dependency-libraries.md), which also makes `backend/wire` part of the composition root wherever this ADR says `cmd/server`.
 - **Date:** 2026-11-08
 
 ## Context
