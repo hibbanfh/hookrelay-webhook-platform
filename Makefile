@@ -1,4 +1,4 @@
-.PHONY: dev down build test test-backend test-frontend lint lint-backend lint-layers lint-frontend \
+.PHONY: wire wire-check dev down build test test-backend test-frontend lint lint-backend lint-layers lint-frontend \
         migrate-up migrate-down seed gen-api e2e fmt
 
 COMPOSE ?= docker compose
@@ -49,3 +49,9 @@ gen-api: ## Regenerate frontend API types from api/openapi.yaml
 
 e2e: ## Playwright against the running compose stack
 	cd frontend && npx playwright test
+
+wire: ## Regenerate backend/wire/wire_gen.go (pinned google/wire, never the global binary)
+	cd backend && go tool wire gen ./wire
+
+wire-check: ## Fail when wire_gen.go is stale
+	cd backend && go tool wire gen ./wire && git diff --exit-code -- wire/wire_gen.go

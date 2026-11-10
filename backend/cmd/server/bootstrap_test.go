@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"hookrelay/internal/platform/config"
 )
 
 // Values from docs/architecture.md section 12 (DoS row).
@@ -18,7 +20,7 @@ func TestNewServerTimeouts(t *testing.T) {
 }
 
 func TestServerWriteTimeoutOutlastsTheRequestTimeout(t *testing.T) {
-	if writeTimeout <= requestTimeout {
-		t.Fatalf("WriteTimeout %v must exceed the per-request timeout %v or clients see resets instead of JSON errors", writeTimeout, requestTimeout)
+	if writeTimeout <= config.APIRequestTimeout {
+		t.Fatalf("WriteTimeout %v must exceed the per-request timeout %v or clients see resets instead of JSON errors", writeTimeout, config.APIRequestTimeout)
 	}
 }

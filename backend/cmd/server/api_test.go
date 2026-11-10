@@ -12,8 +12,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"hookrelay/internal/library/logger"
 	"hookrelay/internal/platform/config"
-	"hookrelay/internal/platform/logging"
+	"hookrelay/wire"
 )
 
 // newTestAPI builds the real handler chain on a pool that never connects (pgxpool is lazy).
@@ -26,9 +27,16 @@ func newTestAPI(t *testing.T, creationEnabled bool) (http.Handler, *bytes.Buffer
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	cfg := config.Config{ProjectCreationEnabled: creationEnabled, MaxBodyBytes: 64, DemoReceiverEnabled: true, DemoReceiverBaseURL: "http://x/demo"}
+	cfg := config.Config{
+		ProjectCreationEnabled: creationEnabled, MaxBodyBytes: 64, DemoReceiverEnabled: true, DemoReceiverBaseURL: "http://x/demo",
+		SecretEncryptionKey: bytes.Repeat([]byte{1}, 32), MaxEndpointsPerProject: 20,
+	}
 	var logs bytes.Buffer
-	return newAPIHandler(cfg, logging.New(&logs, slog.LevelInfo, "test"), pool), &logs
+	api, err := wire.InitializeRouter(cfg, logger.New(&logs, slog.LevelInfo, "test"), pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return api, &logs
 }
 
 func TestAPIWiring(t *testing.T) {
@@ -66,12 +74,18 @@ func TestAPIWiring(t *testing.T) {
 			if !strings.HasPrefix(id, "req_") || !strings.Contains(logs.String(), id) {
 				t.Fatalf("request id %q must be returned and logged: %s", id, logs.String())
 			}
-			assertAccessLogLine(t, logs.String(), tt.method, tt.path, tt.wantStatus)
+			assertAccessLogLine(t, logs.String(), accessLog{method: tt.method, path: tt.path, status: tt.wantStatus})
 		})
 	}
 }
 
-func assertAccessLogLine(t *testing.T, logs, method, path string, status int) {
+// accessLog is the expected content of the one access log line of a request.
+type accessLog struct {
+	method, path string
+	status       int
+}
+
+func assertAccessLogLine(t *testing.T, logs string, want accessLog) {
 	t.Helper()
 	lines := strings.Split(strings.TrimSpace(logs), "\n")
 	if len(lines) != 1 {
@@ -82,7 +96,7 @@ func assertAccessLogLine(t *testing.T, logs, method, path string, status int) {
 		t.Fatal(err)
 	}
 	_, hasDuration := line["duration_ms"]
-	if line["method"] != method || line["path"] != path || int(line["status"].(float64)) != status || !hasDuration {
+	if line["method"] != want.method || line["path"] != want.path || int(line["status"].(float64)) != want.status || !hasDuration {
 		t.Fatalf("unexpected access log: %v", line)
 	}
 }

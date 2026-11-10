@@ -78,8 +78,8 @@ for m in $DOMAINS; do
 	only "$m: data/model imports the stdlib only" \
 		'$^' \
 		"$M/data/model"
-	only "$m: data/source imports data/model, pgx and platform only" \
-		"$P/data/model|github.com/jackc/pgx|$MOD/platform" \
+	only "$m: data/source imports data/model, pgx and library/postgres only" \
+		"$P/data/model|github.com/jackc/pgx|$MOD/library/postgres" \
 		"$M/data/source"
 	only "$m: data/repository imports data/source, data/model and domain/{entity,errors,repository} only" \
 		"$P/data/(source|model)|$P/domain/(entity|errors|repository)" \
@@ -122,6 +122,22 @@ for d in $DOMAINS; do
 		"hookrelay/internal/$d(/|\")" \
 		internal/platform
 done
+
+# 5b. libraries (ADR 0012): no module, platform, other library or composition root; platform
+# never imports a library; only the composition root (backend/wire, cmd/server) imports
+# hookrelay/wire; modules never import google/wire.
+check "a library must not import anything from this repo" \
+	'"hookrelay/' \
+	internal/library
+check "platform must not import a library" \
+	"$MOD/library(/|\")" \
+	internal/platform
+check "nothing under internal may import the composition root" \
+	'"hookrelay/wire"' \
+	internal
+check "a module must not import google/wire (provider sets live in backend/wire)" \
+	'"github.com/google/wire"' \
+	$(for d in $DOMAINS; do echo "internal/$d"; done) internal/platform
 
 # 6. go list based double check on the innermost layer, when domain packages exist:
 # transitive deps may only be stdlib or other domain/* packages of the same module.

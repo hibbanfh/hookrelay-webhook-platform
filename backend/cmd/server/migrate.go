@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 
-	"hookrelay/internal/platform/postgres"
+	"hookrelay/internal/library/logger"
+	"hookrelay/internal/library/postgres"
 	"hookrelay/migrations"
 )
 
@@ -18,13 +20,13 @@ func runMigrate(args []string) error {
 	if dir != postgres.Up && dir != postgres.Down {
 		return fmt.Errorf("unknown migrate direction %q (want up|down)", args[0])
 	}
-	cfg, log, err := loadConfig("migrate")
+	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
 	if err := postgres.Migrate(cfg.DatabaseURL, migrations.Files, dir); err != nil {
 		return err
 	}
-	log.Info("migrations applied", slog.String("direction", string(dir)))
+	logger.New(os.Stdout, cfg.LogLevel, "migrate").Info("migrations applied", slog.String("direction", string(dir)))
 	return nil
 }

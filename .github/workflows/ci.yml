@@ -37,6 +37,8 @@ jobs:
           go-version-file: backend/go.mod
           cache-dependency-path: backend/go.sum # caches the module and build caches
 
+      - name: Wire graph is current
+        run: go tool wire gen ./wire && git diff --exit-code -- wire/wire_gen.go
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: go vet

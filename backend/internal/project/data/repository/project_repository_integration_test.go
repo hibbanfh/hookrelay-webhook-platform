@@ -19,7 +19,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 
-	platformpg "hookrelay/internal/platform/postgres"
+	platformpg "hookrelay/internal/library/postgres"
 	repositoryimpl "hookrelay/internal/project/data/repository"
 	"hookrelay/internal/project/data/source"
 	"hookrelay/internal/project/domain/entity"
