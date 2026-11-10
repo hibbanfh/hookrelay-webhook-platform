@@ -96,11 +96,19 @@ export interface paths {
         put?: never;
         /**
          * Register a receiver URL; returns its signing secret
-         * @description Validation: `url` must be an absolute `http(s)` URL of at most 2048 characters; `description` at most
-         *     255 characters. In production mode the URL must be `https://` and its host must not be, or resolve to,
-         *     a loopback, private (RFC 1918), link-local (incl. `169.254.169.254`), CGNAT, unique-local IPv6 or other
-         *     non-public address, unless it matches the operator allowlist (the built-in demo receiver).
-         *     A project may have at most 20 endpoints (configurable); creating more returns `409 conflict`.
+         * @description Validation: `url` must be an absolute `http(s)` URL of at most 2048 characters with no embedded
+         *     credentials; `description` at most 255 characters and never `null`. In production mode the URL must be
+         *     `https://` and its host must not be, or resolve to, a loopback, private (RFC 1918), link-local
+         *     (incl. `169.254.169.254`), CGNAT, unique-local IPv6 or other non-public address, unless it matches the
+         *     operator allowlist (the built-in demo receiver). A hostname that cannot be resolved (no records, DNS
+         *     error or timeout) is rejected with `400 validation_error`, field `url`. Registration makes no HTTP call
+         *     to the URL.
+         *
+         *     A project may have at most `MAX_ENDPOINTS_PER_PROJECT` endpoints (20 by default), disabled ones included.
+         *     Creating more returns `409 conflict` with a message that names the limit. The limit holds under
+         *     concurrent requests. `409 project_not_provisioned` is also possible for a session without a project.
+         *
+         *     This response and `GET /v1/endpoints/{endpoint_id}/secret` are the only places the signing secret appears.
          */
         post: operations["createEndpoint"];
         delete?: never;
@@ -114,6 +122,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -127,9 +136,15 @@ export interface paths {
         head?: never;
         /**
          * Update url, description and/or enabled
-         * @description Partial update. Omitted fields are unchanged; at least one field is required. The same validation rules
-         *     as create apply. Disabling an endpoint makes its not-yet-attempted deliveries fail with
-         *     `endpoint_disabled` when they come due. Concurrent patches of different fields do not overwrite each other.
+         * @description Partial update. A field that is absent stays unchanged. A field that is present is validated and applied.
+         *     No field is nullable: an explicit `null` returns `400 validation_error` with that field, and it is never
+         *     treated as absent. To clear `description`, send `""`. At least one field is required; `{}` returns
+         *     `400 validation_error` with field `body`. The same validation rules as create apply, and `url` is
+         *     re-checked whenever it is present, even if unchanged. The secret is not affected.
+         *
+         *     Every successful patch sets `updated_at`, even if the values did not change. Disabling an endpoint makes
+         *     its not-yet-attempted deliveries fail with `endpoint_disabled` when they come due. Concurrent patches of
+         *     different fields do not overwrite each other.
          */
         patch: operations["updateEndpoint"];
         trace?: never;
@@ -139,6 +154,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -158,6 +174,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -379,7 +396,7 @@ export interface components {
                 code: components["schemas"]["ErrorCode"];
                 /** @description Human readable; safe to show to users. */
                 message: string;
-                /** @description Present on `validation_error`; the input that failed (body field, `limit`, `cursor`, `status`, `Idempotency-Key`). */
+                /** @description Present on `validation_error` when one input failed (body field, `body` for an empty patch, `limit`, `cursor`, `status`, `Idempotency-Key`). */
                 field?: string;
             };
         };
@@ -436,6 +453,7 @@ export interface components {
             /** @default  */
             description: string;
         };
+        /** @description Absent fields stay unchanged. No field accepts `null`. */
         UpdateEndpointRequest: {
             /** Format: uri */
             url?: string;
@@ -744,6 +762,7 @@ export interface components {
         Limit: number;
         /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
         Cursor: string;
+        /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
         EndpointID: components["schemas"]["EndpointID"];
         MessageID: components["schemas"]["MessageID"];
         DeliveryID: components["schemas"]["DeliveryID"];
@@ -962,6 +981,8 @@ export interface operations {
             /** @description Endpoint created. `signing_secret` is included. */
             201: {
                 headers: {
+                    "Cache-Control": components["headers"]["NoStore"];
+                    "X-Request-Id": components["headers"]["XRequestId"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -981,6 +1002,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -1008,6 +1030,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -1046,6 +1069,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
@@ -1055,8 +1079,8 @@ export interface operations {
             /** @description The signing secret. */
             200: {
                 headers: {
-                    /** @description Always `no-store`. */
-                    "Cache-Control"?: "no-store";
+                    "Cache-Control": components["headers"]["NoStore"];
+                    "X-Request-Id": components["headers"]["XRequestId"];
                     [name: string]: unknown;
                 };
                 content: {
@@ -1082,6 +1106,7 @@ export interface operations {
             };
             header?: never;
             path: {
+                /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
                 endpoint_id: components["parameters"]["EndpointID"];
             };
             cookie?: never;
