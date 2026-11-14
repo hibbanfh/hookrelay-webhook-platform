@@ -1,7 +1,7 @@
 # Hookrelay: Architecture
 
 **Status:** v0.1 design, covering MVP scope (US-001 to US-008, US-010, US-025)
-**Owner:** Architect · **Last updated:** 2026-11-13
+**Owner:** Architect · **Last updated:** 2026-11-14
 **Contract:** [`api/openapi.yaml`](../api/openapi.yaml) · **Decisions:** [`docs/adr/`](adr/)
 
 > **In one paragraph:** Hookrelay is a Go modular monolith with two processes from one binary: an
@@ -284,7 +284,7 @@ domain's port or a CLI command.
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrLimitReached` (409, message names the limit) | |
 | Port | `EndpointRepository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` locks the `projects` row `FOR NO KEY UPDATE`, then counts in a second statement, and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
 | Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox` |
-| Port | `Directory{GetTargets, GetState}` | system reads for other domains (US-004/006/007). The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
+| Port | `DeliveryTargetReader{GetTargets(ctx, ids) (TargetBatch{Targets, Unreadable}, error)}` | US-004. System-level batch read for the worker; opens each secret with `SecretCipher`. A secret that fails to open is listed in `Unreadable` instead of failing the batch. `GetState` follows in US-006/007. The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
 | Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `library/netguard`. Non-nil means rejected; the use case converts it to `ValidationError{Field:"url"}` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `RandomSource`, `TxManager` | |
 | Use case | `CreateEndpoint` | `POST /v1/endpoints`. Flow: entity → URLPolicy → tx{CountForUpdate ≥ limit → `ErrLimitReached`; Create} |
@@ -292,7 +292,7 @@ domain's port or a CLI command.
 | Use case | `GetEndpoint` | `GET /v1/endpoints/{id}` |
 | Use case | `GetEndpointSecret` | `GET /v1/endpoints/{id}/secret` |
 | Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (whenever `url` is present) → UpdateFields |
-| Use case | `GetDeliveryTargets` | internal, batch `{url, secret, enabled}` by IDs for `dispatch.EndpointCatalog` (US-004) |
+| Use case | `GetDeliveryTargets` | internal, batch `{project_id, url, enabled, secret}` by IDs for `dispatch.EndpointCatalog` (US-004, ADR 0014). One `WHERE id = ANY($1)` query |
 | Use case | `GetEndpointState` | internal, `{enabled}` scoped by project, or `ErrNotFound` (US-006/US-007) |
 | Use case | `ListDemoSigningSecrets` | internal, secrets of a project's endpoints whose URL starts with the demo receiver prefix (US-010) |
 
@@ -306,7 +306,7 @@ Full plan: [`docs/plans/us-003.md`](plans/us-003.md). Decisions: ADR 0013.
 | Value | `IdempotencyKey` (1-255 chars, `0x21`-`0x7E`), `Fingerprint` = SHA-256(`event_type` ‖ `0x00` ‖ payload bytes), `IdempotencyRecord` | Identical request means the same event type and byte-identical payload |
 | Value | `PendingDelivery{ID, ProjectID, MessageID, EndpointID, CreatedAt}` | Only the initial state of a delivery. `dispatch` owns the full `Delivery` (US-004) |
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrIdempotencyMismatch` (422) | |
-| Port | `MessageRepository{Create, Get}` | US-006 adds `List`, `GetMany`. Note for US-006: `created_at` is taken before the publish transaction opens, so rows can commit out of `created_at` order; keyset paging must not assume that a page boundary is final (a late-committing older row can appear after a cursor was issued) |
+| Port | `MessageRepository{Create, Get, GetMany}` | `GetMany` (US-004) is the system-level batch read behind `GetMessagePayloads`. US-006 adds `List`. Note for US-006: `created_at` is taken before the publish transaction opens, so rows can commit out of `created_at` order; keyset paging must not assume that a page boundary is final (a late-committing older row can appear after a cursor was issued) |
 | Port | `IdempotencyStore{Reserve, Find}` | `Reserve` is one `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= $now RETURNING` (§8.1, ADR 0013) |
 | Port (cross-module read) | `EndpointDirectory{EnabledEndpointIDs(ctx, projectID)}` | Implemented in `message/data` (`fanout_persistent.go`) on the `endpoints` table, read only (ADR 0013) |
 | Port (cross-module append) | `DeliveryOutbox{Enqueue(ctx, []PendingDelivery)}` | Implemented in `message/data` (`fanout_persistent.go`). One `INSERT ... SELECT FROM unnest(...)` that joins the publish tx via ctx (ADR 0013) |
@@ -315,32 +315,37 @@ Full plan: [`docs/plans/us-003.md`](plans/us-003.md). Decisions: ADR 0013.
 | Use case | `PublishMessage` | `POST /v1/messages`. Returns `{Message, Replayed bool}` |
 | Use case | `ListMessages` | `GET /v1/messages`. One page query plus one `GROUP BY` summary query (no N+1) |
 | Use case | `GetMessage` | `GET /v1/messages/{id}`. Message plus ≤ 20 deliveries |
-| Use case | `GetMessagePayloads` | internal, batch by IDs for `dispatch.MessageCatalog` (worker) |
+| Use case | `GetMessagePayloads` | internal, batch by IDs for `dispatch.MessageCatalog` (worker, US-004). One `WHERE id = ANY($1)` query |
 
 ### 5.4 `dispatch`: deliveries, attempts, worker
 
+Full plan for US-004: [`docs/plans/us-004.md`](plans/us-004.md). Decisions: ADR 0014 (polling, claim and lease,
+fenced completion, catalog adapters, shutdown).
+
 | Kind | Name | Notes |
 |---|---|---|
-| Entity | `Delivery{ID, ProjectID, MessageID, EndpointID, Status, Trigger, AttemptCount, NextAttemptAt, LastAttemptAt, CreatedAt}` | State machine in §8.3. Methods: `NewPending`, `Replay(now)`, `ApplyOutcome(outcome, policy, jitter, now) (Delivery, Attempt)` |
-| Entity | `Attempt{ID, DeliveryID, Number, Trigger, StartedAt, Duration, ResponseStatus *int, ResponseBody, Truncated, Error}` | |
-| Value | `Status` (`pending`/`succeeded`/`failed`), `Trigger` (`automatic`/`manual`), `AttemptError` (`timeout`, `connection_error`, `dns_error`, `destination_blocked`, `endpoint_disabled`) | typed constants |
-| Value | `RetryPolicy{Delays []time.Duration, Jitter float64}` | `NextDelay(attemptNumber, u) (d, ok)`. Max attempts = `len(Delays)+1` |
-| Func | `Sign(secret []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
-| Errors | `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrLeaseLost`, `ErrConflict` | |
-| Port | `Repository{ClaimDue, CompleteAttempt, RequeueForReplay}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that |
-| Port | `Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}` | all scoped by `project_id` |
-| Port (outbound) | `Sender{Send(ctx, OutboundRequest) Outcome}` | `data/webhookhttp`: SSRF-guarded client that classifies errors into `AttemptError` |
-| Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids), GetState(ctx, projectID, id)}` | → `endpoint.GetDeliveryTargets` / `endpoint.GetEndpointState` |
-| Port (cross-domain) | `MessageCatalog{GetPayloads(ctx, ids)}` | → `message.GetMessagePayloads` |
-| Ports (usecase) | `Clock`, `IDGenerator`, `Jitter` (`Float64() float64`), `TxManager` | |
-| Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `[]Job` (3 queries per batch) |
-| Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → `CompleteAttempt` |
-| Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` |
-| Use case | `ListDeliveryAttempts` | `GET /v1/deliveries/{id}/attempts` |
-| Use case | `ListEndpointDeliveries` | `GET /v1/endpoints/{id}/deliveries`. Ownership via `EndpointCatalog.GetState` → 404 |
-| Use case | `SummarizeDeliveries` | internal, for `message.DeliveryReader` |
-| Use case | `ListMessageDeliveries` | internal, for `message.DeliveryReader` |
-| Adapter in | `delivery/worker.Runner` | poll loop, bounded concurrency, graceful shutdown (§8.2) |
+| Entity | `Delivery{ID, ProjectID, MessageID, EndpointID, Status, Trigger, AttemptCount, NextAttemptAt, LastAttemptAt, Lease}` | State machine in §8.3. `ApplyOutcome(result, RetryPlanner, now) (Delivery, Attempt)` is the single place the rules live. US-007 adds `Replay(now)` |
+| Entity | `Attempt{ID, ProjectID, DeliveryID, Number, Trigger, StartedAt, Duration, StatusCode, Body ResponseBody, Err}` | `Number = attempt_count + 1` at claim time |
+| Value | `Status` (`pending`/`succeeded`/`failed`), `Trigger` (`automatic`/`manual`), `AttemptError` (`timeout`, `connection_error`, `dns_error`, `destination_blocked`, `endpoint_disabled`; the last two are terminal), `Lease{Token, ExpiresAt}` | typed constants |
+| Value | `Outcome{StatusCode, Body, Err}`, `ResponseBody{Text, Truncated}` | `NewResponseBody` keeps at most 4096 bytes of valid UTF-8 without NUL |
+| Value | `Target{EndpointID, ProjectID, URL, Enabled, Key SigningKey}`, `Job{Delivery, Target, Payload}`, `SignedRequest` | `SigningKey` redacts itself like `endpoint.SigningSecret` |
+| Strategy | `RetryPlanner{Next(attemptNumber, now) (time.Time, bool)}` | `NoRetry` in US-004. US-005 adds the jittered backoff schedule (§8.3) and changes only wiring |
+| Func | `Sign(key []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
+| Errors | `ErrLeaseLost`, `ErrSendAborted` (US-004); `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrConflict` (US-006/007) | |
+| Port | `DeliveryQueue{ClaimDue(ctx, now, limit, lease), Complete(ctx, delivery, leaseToken)}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that. US-007 adds `RequeueForReplay` |
+| Port | `AttemptRepository{Create}` | append-only. US-006 adds the reads (`Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}`) |
+| Port (outbound) | `Sender{Send(ctx, SignedRequest) (Outcome, error)}` | `data/webhookhttp`: netguard-guarded client. Network failures are outcomes; the only error is `ErrSendAborted` |
+| Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids)}` | → `endpoint.GetDeliveryTargets` (adapter). US-006 adds `GetState` |
+| Port (cross-domain) | `MessageCatalog{GetPayloads(ctx, ids)}` | → `message.GetMessagePayloads` (adapter) |
+| Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` (US-004); `Jitter` (US-005) | |
+| Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `{Jobs, Skipped}` (3 queries per batch) |
+| Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → tx{fenced `Complete`, `Attempts.Create`} |
+| Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` (US-007) |
+| Use case | `ListDeliveryAttempts` | `GET /v1/deliveries/{id}/attempts` (US-006) |
+| Use case | `ListEndpointDeliveries` | `GET /v1/endpoints/{id}/deliveries`. Ownership via `EndpointCatalog.GetState` → 404 (US-006) |
+| Use case | `SummarizeDeliveries` | internal, for `message.DeliveryReader` (US-006) |
+| Use case | `ListMessageDeliveries` | internal, for `message.DeliveryReader` (US-006) |
+| Adapter in | `delivery/worker.Runner` | poll loop, free-slot claiming, bounded `errgroup`, drain context, DB-error backoff, heartbeat (§8.2) |
 
 ### 5.5 `demoreceiver`: built-in receiver that fails on purpose (US-010)
 
@@ -488,12 +493,12 @@ CREATE INDEX deliveries_endpoint_idx       ON deliveries (endpoint_id, created_a
 CREATE INDEX deliveries_endpoint_status_idx ON deliveries (endpoint_id, status, created_at DESC, id DESC);
 -- message lookups use the UNIQUE (message_id, endpoint_id) index
 
--- 0005 (US-004)
+-- 0005 (US-004, ADR 0014): written at completion only, fenced by the lease
 CREATE TABLE attempts (
   id                      text PRIMARY KEY CHECK (id LIKE 'att\_%'),
   project_id              text NOT NULL,
   delivery_id             text NOT NULL,
-  attempt_number          integer NOT NULL CHECK (attempt_number >= 1),
+  attempt_number          integer NOT NULL CHECK (attempt_number >= 1),   -- attempt_count + 1 at claim
   trigger                 text NOT NULL CHECK (trigger IN ('automatic','manual')),
   started_at              timestamptz NOT NULL,
   duration_ms             integer NOT NULL CHECK (duration_ms >= 0),
@@ -504,7 +509,9 @@ CREATE TABLE attempts (
                                                 'destination_blocked','endpoint_disabled')),
   UNIQUE (delivery_id, attempt_number),             -- ordering + guards double-recording
   FOREIGN KEY (delivery_id, project_id) REFERENCES deliveries (id, project_id),
-  CHECK (response_status IS NOT NULL OR error IS NOT NULL)
+  CHECK ((response_status IS NULL) <> (error IS NULL)),          -- answered xor failed to answer
+  CHECK (response_body IS NULL OR response_status IS NOT NULL),
+  CHECK (NOT response_body_truncated OR response_body IS NOT NULL)
 );
 
 -- 0006 (US-010)
@@ -577,7 +584,7 @@ erDiagram
 | 0002 | US-025 | `projects.neon_user_id uuid NULL` + `UNIQUE` (expand-only; written) |
 | 0003 | US-002 | `endpoints` |
 | 0004 | US-003 | `messages`, `idempotency_keys`, `deliveries` + indexes (written) |
-| 0005 | US-004 | `attempts` |
+| 0005 | US-004 | `attempts` (no change to `deliveries`; SQL in `docs/plans/us-004.md` section 5) |
 | 0006 | US-010 | `demo_receiver_hits` |
 
 US-025 took number 0002 because it ships before US-002. US-003 merged the planned `messages` and
@@ -671,7 +678,7 @@ sequenceDiagram
 **Claim** (one statement, its own short transaction):
 
 ```sql
-WITH due AS (
+WITH due AS MATERIALIZED (       -- run the locking subquery exactly once (ADR 0014)
   SELECT id FROM deliveries
   WHERE status = 'pending' AND next_attempt_at <= @now
   ORDER BY next_attempt_at
@@ -684,13 +691,15 @@ FROM due WHERE d.id = due.id
 RETURNING d.id, d.project_id, d.message_id, d.endpoint_id, d.trigger, d.attempt_count;
 ```
 
+**Clock assumption.** `@now` and the lease expiry come from the worker clock, while the first `next_attempt_at` is written by the API clock at publish. The design assumes the hosts are NTP-synchronised. A skew larger than `WORKER_LEASE_DURATION` can make a row due early or a lease expire while its attempt is still running, which causes a duplicate `POST`. That is within at-least-once delivery, and receivers dedupe by `webhook-id`. The fenced completion still records only one result.
+
 **Complete** (one short transaction):
 
 ```sql
 UPDATE deliveries
 SET status = @status, attempt_count = @attempt_count, next_attempt_at = @next_attempt_at,
     last_attempt_at = @started_at, lease_token = NULL, updated_at = @now
-WHERE id = @id AND lease_token = @lease_token;          -- 0 rows → ErrLeaseLost → ROLLBACK
+WHERE id = @id AND lease_token = @lease_token AND status = 'pending';  -- 0 rows → ErrLeaseLost → ROLLBACK
 INSERT INTO attempts (...) VALUES (...);
 ```
 
@@ -711,15 +720,22 @@ INSERT INTO attempts (...) VALUES (...);
 - **Graceful shutdown (SIGTERM):** cancel the claim loop's context and stop claiming. In-flight
   attempts run on a separate *drain* context that is cancelled only after
   `WORKER_SHUTDOWN_TIMEOUT` (25 s; Fly `kill_timeout = 30`). Wait for the errgroup, close the
-  pool, exit 0. Attempts cut off by the timeout are simply reclaimed after their lease expires.
+  pool, exit 0. An attempt cut off by the drain deadline is reported as `ErrSendAborted`, **not** as
+  a `timeout`, records nothing, and is reclaimed after its lease expires. Completion runs on
+  `context.WithoutCancel` with a 3 s bound, so a response that arrived just in time is still recorded (ADR 0014).
+- **Wake-up:** short polling only (500 ms, immediate re-claim after a full batch). `LISTEN/NOTIFY` was
+  rejected for now: it saves at most 0.5 s on a 5 s budget, needs a dedicated connection per worker and a
+  `NOTIFY` from the `message` module, and polling is still needed for retries and expired leases (ADR 0014).
+- **Attempt numbering:** the claim does not touch `attempt_count`, so a crash consumes no attempt and
+  the retried try reuses the number. Attempts are inserted only at completion.
 - **DB errors in the loop:** log, back off exponentially (capped at 5 s), and keep running. The
   worker never crashes on a transient DB error.
-- **Delivery-time endpoint state:** the job carries `enabled`, `url` and `secret` read *after*
-  the claim. Disabled means an attempt with `endpoint_disabled`, the delivery goes `failed`, and
+- **Delivery-time endpoint state:** the job carries `enabled`, `url` and the secret read *after*
+  the claim, through `EndpointCatalog` → `endpoint.GetDeliveryTargets` (the endpoint module decrypts; `dispatch` never reads `endpoints`). Disabled means an attempt with `endpoint_disabled`, the delivery goes `failed`, and
   no HTTP request is made. Replays use the current URL and secret by construction.
 
 **Sender (`dispatch/data/webhookhttp`)**
-- `http.Client{Timeout: DELIVERY_TIMEOUT (10 s)}` and `CheckRedirect: ErrUseLastResponse`.
+- One `context.WithTimeout(DELIVERY_TIMEOUT)` (10 s) per attempt covers dial, TLS, headers and the body read; `CheckRedirect: ErrUseLastResponse`.
   The transport uses the netguard `DialContext` (ADR 0003), `Proxy: nil`, TLS ≥ 1.2,
   `MaxResponseHeaderBytes` 16 KB and keep-alives enabled.
 - Headers: `content-type: application/json`, `user-agent: Hookrelay/<version> (+repo)`,
@@ -728,7 +744,7 @@ INSERT INTO attempts (...) VALUES (...);
   drained (the connection is closed). Stored as UTF-8 via `strings.ToValidUTF8` with NUL bytes
   stripped, cut on a rune boundary.
 - Error classification (`errors.Is/As`, never string matching): `netguard.ErrDestinationBlocked`
-  → `destination_blocked`. A timeout (`context.DeadlineExceeded` or `net.Error.Timeout()`) →
+  → `destination_blocked` (checked after "the caller's context ended" → `ErrSendAborted`). A timeout (`context.DeadlineExceeded` or `net.Error.Timeout()`) →
   `timeout`. `*net.DNSError` → `dns_error`. Anything else → `connection_error`. An HTTP response
   of any status → `error = null`, `response_status` set.
 
@@ -1020,17 +1036,15 @@ adapters and no `dispatch` code yet). Use case: `PublishMessage`. Ports: `Messag
 (`messages`, `idempotency_keys`, `deliveries`).
 
 ### US-004: Deliver with signatures
-1. `dispatch/domain`: `attempt.go` (`Attempt`, `AttemptError`), `outcome.go` (`Outcome`, `IsSuccess`, `IsTerminalFailure`), `signature.go` (`Sign`), `delivery.go` (`ApplyOutcome` with a retry policy of 0 delays for now), `repository.go` (`ClaimDue`, `CompleteAttempt`; the `deliveries` table exists since 0004, and `message` creates its rows), `ports.go` (`Sender`, `EndpointCatalog.GetTargets`, `MessageCatalog.GetPayloads`), `ErrLeaseLost`.
-2. `dispatch/usecase`: `claim_due_deliveries.go`, `attempt_delivery.go`. Tests use a fake sender and clock: disabled → no send + `endpoint_disabled`; blocked → failed; 2xx → succeeded; headers and signature correct; lease lost is surfaced.
-3. `endpoint/usecase/get_delivery_targets.go`, `message/usecase/get_message_payloads.go` (+ repo methods).
-4. `migrations/0005_attempts`. `dispatch/data/postgres`: claim and complete queries. Integration tests: two concurrent claimers get disjoint rows; expired lease is reclaimed; stale completion → `ErrLeaseLost`.
-5. `library/netguard/dialer.go` (guarded `DialContext` + `Control`). `dispatch/data/webhookhttp/sender.go`: client, headers, 4 KB read, error classification. Tests cover 3xx, timeout, 1 MB body, blocked IP.
-6. `dispatch/delivery/worker/runner.go`: loop, free-slot claiming, errgroup, drain context, backoff on DB errors, health heartbeat.
-7. Wiring: `cmd/server/worker.go` (sender only built here), adapters `endpointCatalog`, `messageCatalog`. System test: 2 runners × 500 messages.
+Full layer-ordered plan, migration SQL, sender rules and AC → test map: [`docs/plans/us-004.md`](plans/us-004.md).
+Decisions: ADR 0014. Use cases: `dispatch.ClaimDueDeliveries`, `dispatch.AttemptDelivery`, `endpoint.GetDeliveryTargets`,
+`message.GetMessagePayloads`. Ports: `DeliveryQueue`, `AttemptRepository`, `Sender`, `EndpointCatalog`, `MessageCatalog`,
+`RetryPlanner` (`NoRetry`), `Clock`, `IDGenerator`, `TxManager`; `endpoint.DeliveryTargetReader`; `message.MessageRepository.GetMany`.
+Adapters: `wire/adapters.go` (`endpointCatalog`, `messageCatalog`). Migration `0005_attempts`.
 
 ### US-005: Retries
-1. `dispatch/domain/retry_policy.go` (`RetryPolicy`, `NextDelay`). Full `ApplyOutcome` table from §8.3.
-2. `dispatch/usecase/ports.go`: `Jitter`. `AttemptDelivery` passes policy and jitter. Tests: `[1s,2s]` → 3 attempts, gaps, exhausted → `failed` with `next_attempt_at = null`, success on retry stops further attempts, blocked → no retry.
+1. `dispatch/domain/entity/backoff_schedule.go` (`BackoffSchedule` implements `RetryPlanner`: `Delays`, jitter via the `Jitter` port). `ApplyOutcome` already has the full §8.3 table from US-004.
+2. `dispatch/domain/usecase/jitter.go`: `Jitter`. `wire/dispatch.go` replaces `ProvideRetryPlanner` (`NoRetry`) with the schedule. Tests: `[1s,2s]` → 3 attempts, gaps, exhausted → `failed` with `next_attempt_at = null`, success on retry stops further attempts, blocked → no retry.
 3. `platform/config`: parse `RETRY_SCHEDULE`, `RETRY_JITTER`. `platform/random`: jitter source.
 4. No migration. Integration test: restart the runner before the retry is due, and the retry still fires at or after `next_attempt_at`.
 
@@ -1107,3 +1121,13 @@ adapters and no `dispatch` code yet). Use case: `PublishMessage`. Ports: `Messag
 13. **Q13 (US-025): The public demo now needs a Neon account** (user decision: reviewers sign up
     themselves). The README must say so, and the seeded demo project (no owner) is kept only for
     API-key examples.
+14. **Q14 (US-004): A SIGKILLed attempt leaves no attempt row.** The receiver may have handled it, and the
+    retried try reuses the same attempt number. Recording "started" rows would need a reaper (ADR 0014). Accept?
+15. **Q15 (US-004): "Failed with reason `endpoint_disabled`"** is stored as the delivery's last attempt
+    (`error = endpoint_disabled`, no HTTP request, `duration_ms = 0`), not as a column on the delivery. US-006 shows it
+    from the attempt list. Confirm that this satisfies the AC.
+16. **Q16 (US-004): Until US-005 ships, every non-2xx is final.** Ship US-004 and US-005 together to the public demo?
+17. **Q17 (US-004): Receiver response bodies (first 4 KB) are stored and shown in the dashboard.** A receiver that
+    echoes secrets would expose them to the project's users. The webhook docs warn about it. Accept?
+18. **Q18 (US-004): The `User-Agent` names the repository URL.** `https://github.com/hookrelay/hookrelay` is a
+    placeholder until the real public repo URL is known.
