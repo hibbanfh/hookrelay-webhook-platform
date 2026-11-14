@@ -228,7 +228,9 @@ Notes / out of scope:
 
 ---
 
-### US-003: Publish a message            [status: todo]  [priority: P0]
+### US-003: Publish a message            [status: done]  [priority: P0]
+
+> **Done 2026-11-13.** All 12 criteria PASS live on the real binary against real PostgreSQL (20 parallel same-key requests → 1 message; byte-for-byte payload checked with `cmp`; 262144 B → 202, 262145 B → 413; forced mid-transaction failure → 500 with no rows and the key not consumed), plus unit, Testcontainers integration (including a deterministic lock-wait test for commit and rollback of the first request) and `go test -race` in a Linux container. BUG-QA-014 fixed. Review approved after one round of fixes. Decisions: ADR 0013. A payload that differs only in whitespace or key order under the same `Idempotency-Key` is `422` (strict byte fingerprint). Open: no publish rate limit until US-012.
 As a platform developer, I want to publish an event with one API call that returns
 immediately, so that sending webhooks never slows down or breaks my own application.
 
@@ -622,3 +624,11 @@ multi-language SDKs. See `docs/PRD.md` section 5.
 - **Expected:** `400 validation_error`, field `url`. **Actual:** `201` in development and production (production resolves the host and ignores the port). Every delivery to such a URL fails later.
 - **Suspected area:** `endpoint/domain/entity` URL validation (`url.Port()` is only checked to be numeric by `net/url`); require 1..65535 when present.
 - **Fixed in:** `endpoint/domain/entity/endpoint_validation.go` (`hasValidPort`, both modes). Tests: port 0, 65536, 99999, empty (IPv4 host and IPv6) and 1 / 65535 rows in `TestNewEndpoint`.
+
+### BUG-QA-014: a client that stalls its upload gets `500 internal` and an ERROR log on `POST /v1/messages` (US-003)   [minor] - FIXED
+- **Status: fixed.** `httpx.ReadBody` keeps `*http.MaxBytesError` (413) and maps any other read error to `400 validation_error` "could not read request body" with the original error as `Cause` (a 4xx is not logged, so no ERROR line). 408 was not used, to stay consistent with the other routes and the contract. **Test:** `TestReadBodyMapsReadFailuresToBadRequest` (`os.ErrDeadlineExceeded`, connection reset, unexpected EOF; asserts 400, the message, the cause and an empty log).
+- **Steps:** open a TCP connection, send the headers of `POST /v1/messages` with a valid API key and `Content-Length: 60`, send 22 body bytes, then send nothing. (QA used a 10-line Python socket script.)
+- **Expected:** a 4xx (400, or 408) and no ERROR log: the fault is the client's. `POST /v1/endpoints` with the same stall answers `400` after 15 s. **Actual:** after 15 s, `500 internal` and an `unhandled error` ERROR line. Nothing is stored.
+- **Impact:** any slow or broken client or a network drop mid-upload counts as a server error in the 5xx metric and alerts, and makes the API look unhealthy. Publish is the highest-traffic route, so it is the one that matters.
+- **Cause:** `httpx.ReadBody` wraps every `io.ReadAll` error with `%w`. Only `*http.MaxBytesError` is recognised by `Responder.Error`, so a read timeout or a connection reset falls through to the generic 500. The streaming `DecodeJSON` used by the other routes turns the same error into a 400.
+- **Suspected area:** `backend/internal/platform/httpx/body.go` (map any non-`MaxBytesError` read failure to a 400 with `CodeValidation`/"could not read request body", logged at INFO/WARN), plus a `body_test.go` row with a reader that returns `os.ErrDeadlineExceeded`.

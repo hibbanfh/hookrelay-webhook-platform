@@ -19,6 +19,8 @@ const (
 	CodePayloadTooLarge  = "payload_too_large"
 	CodeInternal         = "internal"
 
+	CodeIdempotencyMismatch = "idempotency_key_mismatch"
+
 	CodeAuthUnavailable       = "auth_unavailable"
 	CodeProjectNotProvisioned = "project_not_provisioned"
 )

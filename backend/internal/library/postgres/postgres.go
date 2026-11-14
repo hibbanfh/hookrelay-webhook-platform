@@ -77,6 +77,28 @@ func Migrate(dsn string, files fs.FS, dir Direction) error {
 	return run(m, dir)
 }
 
+// MigrateTo moves the schema up or down to exactly version, so a test can say which migration it
+// needs instead of counting Down steps. Being at the version already is not an error.
+func MigrateTo(dsn string, files fs.FS, version uint) error {
+	src, err := iofs.New(files, ".")
+	if err != nil {
+		return fmt.Errorf("load migrations: %w", err)
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", src, migrateURL(dsn))
+	if err != nil {
+		return fmt.Errorf("open migrator: %w", err)
+	}
+	defer m.Close() //nolint:errcheck // close errors carry no actionable information here
+	err = m.Migrate(version)
+	if errors.Is(err, migrate.ErrNoChange) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("migrate to version %d: %w", version, err)
+	}
+	return nil
+}
+
 func run(m *migrate.Migrate, dir Direction) error {
 	var err error
 	switch dir {

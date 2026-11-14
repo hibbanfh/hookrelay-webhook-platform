@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,17 +18,28 @@ var errInvalidJSON = &Error{
 // fields and trailing data are rejected. A body-size violation is returned unchanged so
 // Responder.Error can answer 413.
 func DecodeJSON(r *http.Request, dst any) error {
-	return decodeJSON(r, dst, func(error) error { return errInvalidJSON })
+	return decodeJSON(r.Body, dst, func(error) error { return errInvalidJSON })
 }
 
 // DecodeJSONNamingFields is DecodeJSON, except that a value of the wrong JSON type is reported
 // as a 400 on that field (`{"url":123}` names url), so the client knows which one to fix.
 func DecodeJSONNamingFields(r *http.Request, dst any) error {
-	return decodeJSON(r, dst, namedTypeFailure)
+	return decodeJSON(r.Body, dst, namedTypeFailure)
 }
 
-func decodeJSON(r *http.Request, dst any, fail func(error) error) error {
-	dec := json.NewDecoder(r.Body)
+// DecodeJSONBytes is DecodeJSON for a body that ReadBody already read. The size has been checked,
+// so every failure here is a 400.
+func DecodeJSONBytes(b []byte, dst any) error {
+	return decodeJSON(bytes.NewReader(b), dst, func(error) error { return errInvalidJSON })
+}
+
+// DecodeJSONBytesNamingFields is DecodeJSONNamingFields for a body that ReadBody already read.
+func DecodeJSONBytesNamingFields(b []byte, dst any) error {
+	return decodeJSON(bytes.NewReader(b), dst, namedTypeFailure)
+}
+
+func decodeJSON(src io.Reader, dst any, fail func(error) error) error {
+	dec := json.NewDecoder(src)
 	dec.DisallowUnknownFields()
 	err := dec.Decode(dst)
 	var tooLarge *http.MaxBytesError

@@ -23,6 +23,7 @@ type RouterDeps struct {
 	Clock    httpx.Clock
 	Project  ProjectRoutes
 	Endpoint EndpointRoutes
+	Message  MessageRoutes
 }
 
 // NewRouter builds the routes and wraps them in the middleware chain.
@@ -34,6 +35,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	mux.HandleFunc("GET /healthz", health.Handler(d.Pinger))
 	d.Project.Register(mux)
 	d.Endpoint.Register(mux)
+	d.Message.Register(mux)
 	return httpx.Chain(httpx.JSONFallback(mux),
 		httpx.WithRequestID(func() string { return d.IDs.New(requestIDPrefix) }),
 		httpx.AccessLog(d.Log, d.Clock),

@@ -201,15 +201,31 @@ export interface paths {
         put?: never;
         /**
          * Publish an event; fans out to every enabled endpoint asynchronously
-         * @description Returns `202` after the message and one `pending` delivery per currently enabled endpoint have been
-         *     committed in a single transaction. Makes no outbound HTTP call. Endpoints registered later do not receive
-         *     this message.
+         * @description Returns `202` only after the message and one `pending` delivery per endpoint that is enabled at that
+         *     moment have been committed together in one transaction. If the write fails, the response is `500` and
+         *     neither the message nor any delivery exists. Publishing makes no outbound HTTP call, so it succeeds even
+         *     when every receiver is offline. Endpoints registered (or re-enabled) later do not receive this message;
+         *     a project with no enabled endpoints still gets `202`, with 0 deliveries.
          *
-         *     **Idempotency:** send `Idempotency-Key` to make retries safe. Keys are scoped per project and live
-         *     24 hours. Repeating the same key with an identical `event_type` and `payload` returns the original
-         *     response (same message `id`) with header `Idempotent-Replayed: true` and creates nothing. Reusing a key
-         *     with a different body returns `422 idempotency_key_mismatch`. Concurrent requests with the same key
-         *     produce exactly one message.
+         *     **Order of checks** (the first failure wins): credential (`401`/`409`/`503`) → body size (`413`, decided
+         *     before the body is parsed; nothing is stored) → JSON shape (`400`, unknown fields and trailing data are
+         *     rejected; a field of the wrong type is named in `field`) → `event_type` (`400`, field `event_type`) →
+         *     `payload` (`400`, field `payload`) → `Idempotency-Key` header (`400`, field `Idempotency-Key`) →
+         *     idempotency (`202` replay or `422`).
+         *
+         *     **Idempotency:** send `Idempotency-Key` to make retries safe. Keys are scoped per project: the same key
+         *     in two projects creates two messages. A key stays live for 24 hours from the first successful request
+         *     with it.
+         *     - Same key, *identical* request (same `event_type` and byte-identical `payload`; whitespace and key order
+         *       inside `payload` count): `202` with the **same body as the original response** (same `id`, `event_type`
+         *       and `created_at`) plus header `Idempotent-Replayed: true`. Nothing new is created, and endpoints added
+         *       since the original publish get nothing.
+         *     - Same key, different request: `422 idempotency_key_mismatch`. Nothing is created.
+         *     - Concurrent requests with the same key: exactly one message is created. The others wait for it to commit,
+         *       then get the replay (or `422` if their body differs).
+         *     - A request that fails (`4xx` before the replay check, or `500`) does not consume its key, so the client
+         *       can retry with the same key.
+         *     - After 24 hours the key is free again, and the next request with it creates a new message.
          */
         post: operations["publishMessage"];
         delete?: never;
@@ -223,6 +239,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed message ID returns `404 not_found`, the same as an unknown ID. */
                 message_id: components["parameters"]["MessageID"];
             };
             cookie?: never;
@@ -246,6 +263,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed delivery ID returns `404 not_found`, the same as an unknown ID. */
                 delivery_id: components["parameters"]["DeliveryID"];
             };
             cookie?: never;
@@ -268,6 +286,7 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed delivery ID returns `404 not_found`, the same as an unknown ID. */
                 delivery_id: components["parameters"]["DeliveryID"];
             };
             cookie?: never;
@@ -483,13 +502,23 @@ export interface components {
         };
         /** @example invoice.paid */
         EventType: string;
+        /** @description The whole request body is at most 256 KB (262144 bytes); larger bodies return `413`. */
         PublishMessageRequest: {
+            /**
+             * @description 1 to 100 characters from `[A-Za-z0-9._-]`. Missing, `null`, empty, too long or containing any other
+             *     character returns `400 validation_error` with field `event_type`.
+             */
             event_type: components["schemas"]["EventType"];
-            /** @description Any JSON object. Stored and delivered byte-for-byte as sent. Arrays, strings and null are rejected. */
+            /**
+             * @description Any JSON object, as UTF-8. Stored, returned (US-006) and delivered (US-004) byte-for-byte exactly as
+             *     it appears in the request, including its whitespace and key order. Missing, `null`, an array, a
+             *     string, a number, a boolean, or invalid UTF-8 returns `400 validation_error` with field `payload`.
+             */
             payload: {
                 [key: string]: unknown;
             };
         };
+        /** @description Identical for a first publish and for every idempotent replay of it. */
         MessageAccepted: {
             id: components["schemas"]["MessageID"];
             event_type: components["schemas"]["EventType"];
@@ -764,9 +793,18 @@ export interface components {
         Cursor: string;
         /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
         EndpointID: components["schemas"]["EndpointID"];
+        /** @description A value that is not a well-formed message ID returns `404 not_found`, the same as an unknown ID. */
         MessageID: components["schemas"]["MessageID"];
+        /** @description A value that is not a well-formed delivery ID returns `404 not_found`, the same as an unknown ID. */
         DeliveryID: components["schemas"]["DeliveryID"];
-        /** @description Client-chosen key, 1 to 255 printable ASCII characters, scoped to the project, valid 24 hours. */
+        /**
+         * @description Client-chosen key that makes a publish safe to retry, for example a UUID. 1 to 255 characters, each
+         *     printable ASCII from `!` (0x21) to `~` (0x7E): no spaces, control characters or non-ASCII. Compared
+         *     exactly (case-sensitive). Scoped to the project and live for 24 hours from the first successful request.
+         *     Omit the header to publish without idempotency. An empty value, a value that breaks these rules, or the
+         *     header sent more than once returns `400 validation_error` with field `Idempotency-Key`.
+         * @example 7f3c9b2e-1d4a-4e8b-9a61-2c0f5d8e7b14
+         */
         IdempotencyKey: string;
         /** @description The message ID. Stable across retries and replays. */
         WebhookIDHeader: components["schemas"]["MessageID"];
@@ -779,7 +817,10 @@ export interface components {
     headers: {
         /** @description Request correlation ID, also present in server logs. */
         XRequestId: string;
-        /** @description Present and `true` when the response was replayed from an earlier request with the same `Idempotency-Key`. */
+        /**
+         * @description Present, with value `true`, only when the response was replayed from an earlier request with the same
+         *     `Idempotency-Key`. Absent on a first publish.
+         */
         IdempotentReplayed: "true";
         /** @description Always `no-store`. */
         NoStore: "no-store";
@@ -1164,7 +1205,14 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                /** @description Client-chosen key, 1 to 255 printable ASCII characters, scoped to the project, valid 24 hours. */
+                /**
+                 * @description Client-chosen key that makes a publish safe to retry, for example a UUID. 1 to 255 characters, each
+                 *     printable ASCII from `!` (0x21) to `~` (0x7E): no spaces, control characters or non-ASCII. Compared
+                 *     exactly (case-sensitive). Scoped to the project and live for 24 hours from the first successful request.
+                 *     Omit the header to publish without idempotency. An empty value, a value that breaks these rules, or the
+                 *     header sent more than once returns `400 validation_error` with field `Idempotency-Key`.
+                 * @example 7f3c9b2e-1d4a-4e8b-9a61-2c0f5d8e7b14
+                 */
                 "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
             };
             path?: never;
@@ -1185,7 +1233,11 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Accepted. Deliveries are queued. */
+            /**
+             * @description Accepted: the message and its deliveries are committed and queued. A replay of an earlier request with
+             *     the same `Idempotency-Key` returns the same status and the same body as that original response, plus
+             *     `Idempotent-Replayed: true`. The header is absent on a first publish.
+             */
             202: {
                 headers: {
                     "Idempotent-Replayed": components["headers"]["IdempotentReplayed"];
@@ -1210,6 +1262,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed message ID returns `404 not_found`, the same as an unknown ID. */
                 message_id: components["parameters"]["MessageID"];
             };
             cookie?: never;
@@ -1242,6 +1295,7 @@ export interface operations {
             };
             header?: never;
             path: {
+                /** @description A value that is not a well-formed delivery ID returns `404 not_found`, the same as an unknown ID. */
                 delivery_id: components["parameters"]["DeliveryID"];
             };
             cookie?: never;
@@ -1270,6 +1324,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
+                /** @description A value that is not a well-formed delivery ID returns `404 not_found`, the same as an unknown ID. */
                 delivery_id: components["parameters"]["DeliveryID"];
             };
             cookie?: never;

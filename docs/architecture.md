@@ -1,7 +1,7 @@
 # Hookrelay: Architecture
 
 **Status:** v0.1 design, covering MVP scope (US-001 to US-008, US-010, US-025)
-**Owner:** Architect · **Last updated:** 2026-11-09
+**Owner:** Architect · **Last updated:** 2026-11-13
 **Contract:** [`api/openapi.yaml`](../api/openapi.yaml) · **Decisions:** [`docs/adr/`](adr/)
 
 > **In one paragraph:** Hookrelay is a Go modular monolith with two processes from one binary: an
@@ -25,7 +25,7 @@
 | **Delivery p95 < 2 s** | Worker polls every 500 ms and re-polls immediately when a batch was full. The HTTP call runs outside any DB transaction. |
 | **Secure by default** | Hashed API keys and encrypted signing secrets (ADR 0004), HMAC signatures (ADR 0007), SSRF guard at registration *and* dial time (ADR 0003), project isolation enforced in SQL and with composite foreign keys (§7.3). |
 | **Observable** | Every attempt is persisted with status, latency, body snippet and error class. Structured logs carry request, delivery and attempt IDs (§12). |
-| **Explainable** | Clean Architecture per domain, one use case per endpoint, twelve ADRs, and every trade-off written down. |
+| **Explainable** | Clean Architecture per domain, one use case per endpoint, thirteen ADRs, and every trade-off written down. |
 
 Non-goals that shape the design: no exactly-once, no FIFO per endpoint, no teams or multiple
 projects per user (one Neon Auth user owns one project, US-025), no payload transformations (PRD §5).
@@ -284,7 +284,7 @@ domain's port or a CLI command.
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrLimitReached` (409, message names the limit) | |
 | Port | `EndpointRepository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` locks the `projects` row `FOR NO KEY UPDATE`, then counts in a second statement, and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
 | Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox` |
-| Port | `Directory{ListEnabledIDs, GetTargets, GetState}` | system reads for other domains |
+| Port | `Directory{GetTargets, GetState}` | system reads for other domains (US-004/006/007). The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
 | Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `library/netguard`. Non-nil means rejected; the use case converts it to `ValidationError{Field:"url"}` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `RandomSource`, `TxManager` | |
 | Use case | `CreateEndpoint` | `POST /v1/endpoints`. Flow: entity → URLPolicy → tx{CountForUpdate ≥ limit → `ErrLimitReached`; Create} |
@@ -292,23 +292,25 @@ domain's port or a CLI command.
 | Use case | `GetEndpoint` | `GET /v1/endpoints/{id}` |
 | Use case | `GetEndpointSecret` | `GET /v1/endpoints/{id}/secret` |
 | Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (whenever `url` is present) → UpdateFields |
-| Use case | `ListEnabledEndpointIDs` | internal, used by `message.EndpointDirectory` (US-003) |
 | Use case | `GetDeliveryTargets` | internal, batch `{url, secret, enabled}` by IDs for `dispatch.EndpointCatalog` (US-004) |
 | Use case | `GetEndpointState` | internal, `{enabled}` scoped by project, or `ErrNotFound` (US-006/US-007) |
 | Use case | `ListDemoSigningSecrets` | internal, secrets of a project's endpoints whose URL starts with the demo receiver prefix (US-010) |
 
 ### 5.3 `message`: publish, idempotency, read model
 
+Full plan: [`docs/plans/us-003.md`](plans/us-003.md). Decisions: ADR 0013.
+
 | Kind | Name | Notes |
 |---|---|---|
-| Entity | `Message{ID, ProjectID, EventType, Payload []byte, CreatedAt}` | `NewMessage`: event type `^[A-Za-z0-9._-]{1,100}$`. The payload must be valid JSON whose first non-whitespace byte is `{`. Bytes are kept exactly |
-| Value | `IdempotencyKey` (1-255 printable ASCII), `Fingerprint` = SHA-256(`event_type` ‖ `0x00` ‖ payload bytes) | Identical request means the same event type and byte-identical payload |
+| Entity | `Message{ID, ProjectID, EventType, Payload []byte, CreatedAt}` | `NewMessage`: event type `^[A-Za-z0-9._-]{1,100}$`. The payload must start with `{`, be valid JSON and valid UTF-8. Bytes are kept exactly. `CreatedAt` truncated to µs |
+| Value | `IdempotencyKey` (1-255 chars, `0x21`-`0x7E`), `Fingerprint` = SHA-256(`event_type` ‖ `0x00` ‖ payload bytes), `IdempotencyRecord` | Identical request means the same event type and byte-identical payload |
+| Value | `PendingDelivery{ID, ProjectID, MessageID, EndpointID, CreatedAt}` | Only the initial state of a delivery. `dispatch` owns the full `Delivery` (US-004) |
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrIdempotencyMismatch` (422) | |
-| Port | `Repository{Create, Get, List, GetMany}` | |
-| Port | `IdempotencyStore{Reserve, Find}` | `Reserve` is one `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= $now` (§8.1) |
-| Port (cross-domain) | `EndpointDirectory{EnabledEndpointIDs(ctx, projectID)}` | → `endpoint.ListEnabledEndpointIDs` |
-| Port (cross-domain) | `DeliveryScheduler{Schedule(ctx, projectID, messageID, endpointIDs)}` | → `dispatch.ScheduleDeliveries`, joins the caller's tx via ctx |
-| Port (cross-domain) | `DeliveryReader{Summaries(ctx, projectID, msgIDs), ListForMessage(ctx, projectID, msgID)}` | → `dispatch.SummarizeDeliveries` / `dispatch.ListMessageDeliveries` |
+| Port | `MessageRepository{Create, Get}` | US-006 adds `List`, `GetMany`. Note for US-006: `created_at` is taken before the publish transaction opens, so rows can commit out of `created_at` order; keyset paging must not assume that a page boundary is final (a late-committing older row can appear after a cursor was issued) |
+| Port | `IdempotencyStore{Reserve, Find}` | `Reserve` is one `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= $now RETURNING` (§8.1, ADR 0013) |
+| Port (cross-module read) | `EndpointDirectory{EnabledEndpointIDs(ctx, projectID)}` | Implemented in `message/data` (`fanout_persistent.go`) on the `endpoints` table, read only (ADR 0013) |
+| Port (cross-module append) | `DeliveryOutbox{Enqueue(ctx, []PendingDelivery)}` | Implemented in `message/data` (`fanout_persistent.go`). One `INSERT ... SELECT FROM unnest(...)` that joins the publish tx via ctx (ADR 0013) |
+| Port (cross-domain) | `DeliveryReader{Summaries(ctx, projectID, msgIDs), ListForMessage(ctx, projectID, msgID)}` | → `dispatch.SummarizeDeliveries` / `dispatch.ListMessageDeliveries` (US-006) |
 | Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` | |
 | Use case | `PublishMessage` | `POST /v1/messages`. Returns `{Message, Replayed bool}` |
 | Use case | `ListMessages` | `GET /v1/messages`. One page query plus one `GROUP BY` summary query (no N+1) |
@@ -325,13 +327,12 @@ domain's port or a CLI command.
 | Value | `RetryPolicy{Delays []time.Duration, Jitter float64}` | `NextDelay(attemptNumber, u) (d, ok)`. Max attempts = `len(Delays)+1` |
 | Func | `Sign(secret []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
 | Errors | `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrLeaseLost`, `ErrConflict` | |
-| Port | `Repository{CreateMany, ClaimDue, CompleteAttempt, RequeueForReplay}` | queue operations (§8.2) |
+| Port | `Repository{ClaimDue, CompleteAttempt, RequeueForReplay}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that |
 | Port | `Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}` | all scoped by `project_id` |
 | Port (outbound) | `Sender{Send(ctx, OutboundRequest) Outcome}` | `data/webhookhttp`: SSRF-guarded client that classifies errors into `AttemptError` |
 | Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids), GetState(ctx, projectID, id)}` | → `endpoint.GetDeliveryTargets` / `endpoint.GetEndpointState` |
 | Port (cross-domain) | `MessageCatalog{GetPayloads(ctx, ids)}` | → `message.GetMessagePayloads` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `Jitter` (`Float64() float64`), `TxManager` | |
-| Use case | `ScheduleDeliveries` | internal, called within publish's tx. One multi-row `INSERT ... SELECT unnest(...)` |
 | Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `[]Job` (3 queries per batch) |
 | Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → `CompleteAttempt` |
 | Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` |
@@ -355,10 +356,10 @@ domain's port or a CLI command.
 
 ### 5.6 Cross-domain adapter map (`backend/wire/adapters.go`)
 
+The publish path needs no adapter. `message.EndpointDirectory` and `message.DeliveryOutbox` are implemented in `message/data` (ADR 0013, table ownership rule).
+
 | Consumer port | Implemented by calling | Used in |
 |---|---|---|
-| `message.EndpointDirectory` | `endpoint.ListEnabledEndpointIDs` | publish |
-| `message.DeliveryScheduler` | `dispatch.ScheduleDeliveries` | publish (same tx) |
 | `message.DeliveryReader` | `dispatch.SummarizeDeliveries`, `dispatch.ListMessageDeliveries` | list/get message |
 | `dispatch.EndpointCatalog` | `endpoint.GetDeliveryTargets`, `endpoint.GetEndpointState` | worker, replay, endpoint deliveries |
 | `dispatch.MessageCatalog` | `message.GetMessagePayloads` | worker |
@@ -436,12 +437,12 @@ CREATE TABLE endpoints (
 );
 CREATE INDEX endpoints_project_created_idx ON endpoints (project_id, created_at DESC, id DESC);
 
--- 0004 (US-003)
+-- 0004 (US-003): messages, idempotency keys and the delivery queue in one migration (ADR 0013)
 CREATE TABLE messages (
   id          text PRIMARY KEY CHECK (id LIKE 'msg\_%'),
   project_id  text NOT NULL REFERENCES projects(id),
   event_type  text NOT NULL CHECK (event_type ~ '^[A-Za-z0-9._-]{1,100}$'),
-  payload     bytea NOT NULL,                       -- exact bytes; NOT jsonb (see 7.4)
+  payload     bytea NOT NULL CHECK (octet_length(payload) >= 2),  -- exact bytes; NOT jsonb (see 7.4)
   created_at  timestamptz NOT NULL,
   UNIQUE (id, project_id)
 );
@@ -449,17 +450,19 @@ CREATE INDEX messages_project_created_idx ON messages (project_id, created_at DE
 
 CREATE TABLE idempotency_keys (
   project_id   text NOT NULL REFERENCES projects(id),
-  key          text NOT NULL CHECK (char_length(key) BETWEEN 1 AND 255),
-  fingerprint  bytea NOT NULL,                      -- sha256(event_type || 0x00 || payload)
+  key          text NOT NULL CHECK (key ~ '^[\x21-\x7e]{1,255}$'),
+  fingerprint  bytea NOT NULL CHECK (octet_length(fingerprint) = 32),  -- sha256(event_type || 0x00 || payload)
   message_id   text NOT NULL,
   created_at   timestamptz NOT NULL,
-  expires_at   timestamptz NOT NULL,
-  PRIMARY KEY (project_id, key),                    -- keys are per project
+  expires_at   timestamptz NOT NULL,              -- created_at + IDEMPOTENCY_TTL (24 h)
+  PRIMARY KEY (project_id, key),                    -- keys are per project; the race guard (8.1)
+  CHECK (expires_at > created_at),
   FOREIGN KEY (message_id, project_id) REFERENCES messages (id, project_id)
     DEFERRABLE INITIALLY DEFERRED                   -- key is reserved before the message row exists
 );
+CREATE INDEX idempotency_keys_expires_idx ON idempotency_keys (expires_at);  -- retention (US-016)
+CREATE INDEX idempotency_keys_message_idx ON idempotency_keys (message_id, project_id);  -- deferred FK to messages
 
--- 0005 (US-003)
 CREATE TABLE deliveries (
   id               text PRIMARY KEY CHECK (id LIKE 'dlv\_%'),
   project_id       text NOT NULL,
@@ -485,7 +488,7 @@ CREATE INDEX deliveries_endpoint_idx       ON deliveries (endpoint_id, created_a
 CREATE INDEX deliveries_endpoint_status_idx ON deliveries (endpoint_id, status, created_at DESC, id DESC);
 -- message lookups use the UNIQUE (message_id, endpoint_id) index
 
--- 0006 (US-004)
+-- 0005 (US-004)
 CREATE TABLE attempts (
   id                      text PRIMARY KEY CHECK (id LIKE 'att\_%'),
   project_id              text NOT NULL,
@@ -504,7 +507,7 @@ CREATE TABLE attempts (
   CHECK (response_status IS NOT NULL OR error IS NOT NULL)
 );
 
--- 0007 (US-010)
+-- 0006 (US-010)
 CREATE TABLE demo_receiver_hits (
   endpoint_id   text NOT NULL REFERENCES endpoints(id),
   webhook_id    text NOT NULL,
@@ -556,6 +559,9 @@ erDiagram
   joins and for the composite FKs.
 - **Attempt numbers keep counting across replays**, guaranteed by `UNIQUE (delivery_id,
   attempt_number)` and `attempt_count` being updated in the same transaction.
+- **Table ownership (ADR 0013):** each table has one owning module, which owns its schema, updates and deletes.
+  The only cross-module statements are listed in ADR 0013. `message` reads `endpoints.(id, project_id, enabled)`
+  and appends `deliveries` in their initial state, both from `message/data/source/fanout_persistent.go`.
 - **No status counters on `messages`:** counting deliveries per page with one `GROUP BY` beats
   updating a hot counter row on every attempt.
 
@@ -570,12 +576,13 @@ erDiagram
 | 0001 | M0 | `projects`, `api_keys` |
 | 0002 | US-025 | `projects.neon_user_id uuid NULL` + `UNIQUE` (expand-only; written) |
 | 0003 | US-002 | `endpoints` |
-| 0004 | US-003 | `messages`, `idempotency_keys` |
-| 0005 | US-003 | `deliveries` + indexes |
-| 0006 | US-004 | `attempts` |
-| 0007 | US-010 | `demo_receiver_hits` |
+| 0004 | US-003 | `messages`, `idempotency_keys`, `deliveries` + indexes (written) |
+| 0005 | US-004 | `attempts` |
+| 0006 | US-010 | `demo_receiver_hits` |
 
-US-025 took number 0002 because it ships before US-002. The later rows moved up by one, and none of them had been written yet.
+US-025 took number 0002 because it ships before US-002. US-003 merged the planned `messages` and
+`deliveries` migrations into one, so `attempts` and `demo_receiver_hits` moved to 0005 and 0006
+(neither had been written).
 
 **Safety rules for later migrations:** expand/contract only (add nullable column → backfill →
 constrain). The release command runs before new code, so the *old* code must tolerate the new
@@ -595,7 +602,7 @@ sequenceDiagram
     participant U as PublishMessage
     participant DB as Postgres (one tx)
     C->>H: POST /v1/messages (Idempotency-Key: abc)
-    H->>H: 256 KB limit, decode, syntactic validation
+    H->>H: read whole body (over 256 KB → 413 before parsing), strict decode
     H->>U: Execute(projectID, eventType, payload, key)
     U->>U: NewMessage (invariants), fingerprint
     U->>DB: BEGIN
@@ -604,8 +611,8 @@ sequenceDiagram
         U->>DB: Find key → same fingerprint? return original msg (Replayed) : ErrIdempotencyMismatch
     else reserved (or no key)
         U->>DB: INSERT messages
-        U->>DB: SELECT enabled endpoint IDs (via EndpointDirectory)
-        U->>DB: INSERT deliveries (status=pending, next_attempt_at=now) (via DeliveryScheduler)
+        U->>DB: SELECT enabled endpoint IDs (EndpointDirectory, message/data)
+        U->>DB: INSERT deliveries via unnest (status=pending, next_attempt_at=now) (DeliveryOutbox, message/data)
     end
     U->>DB: COMMIT (deferred FK checked here)
     H-->>C: 202 {id, event_type, created_at} (+ Idempotent-Replayed: true)
@@ -614,16 +621,21 @@ sequenceDiagram
 - **Atomicity:** all writes happen in `TxManager.WithinTx`. Any error rolls back, so the response
   is `500` and nothing exists. "Endpoints registered later don't receive it" falls out of
   snapshotting the enabled endpoints in the same transaction.
-- **Idempotency concurrency:** two identical concurrent requests both reach `Reserve`. The second
-  `INSERT` **blocks on the primary-key index** until the first commits, then finds the row live
-  and returns the first message. If the first rolled back, the second reserves the key itself.
+- **Idempotency concurrency (ADR 0013):** two identical concurrent requests both reach `Reserve`. The second
+  `INSERT` **blocks on the primary-key index** until the first commits. It then finds the row live
+  (the `ON CONFLICT DO UPDATE ... WHERE` is false, so the row is locked and no row is returned), reads it
+  with `Find`, and returns the first message. If the first rolled back, the second reserves the key itself.
+  This relies on `READ COMMITTED`.
   Exactly one message exists either way. Expired keys (`expires_at <= now`) are taken over by the
   `ON CONFLICT DO UPDATE ... WHERE` clause. Cleanup of expired rows is US-016.
 - **Why reserve before inserting the message:** the losing request does no wasted writes, and the
   deferred FK still guarantees no orphan keys survive commit.
 - **No outbound HTTP** is possible here: the API process never constructs a `Sender`.
+- **Replay response:** the same `202` and the same body as the original, plus `Idempotent-Replayed: true`.
+  The body is built from the stored message. `created_at` is truncated to µs before the first response,
+  so both serialize identically.
 - **Outbox note:** the `deliveries` rows *are* the outbox and the queue at the same time, so
-  there's no relay. If a broker is introduced (ADR 0001 exit path), these rows become a classic
+  there's no relay. `message` appends them, and `dispatch` owns them from then on (ADR 0013). If a broker is introduced (ADR 0001 exit path), these rows become a classic
   outbox drained by a relay.
 
 ### 8.2 Delivery pipeline (US-004/005): claim → send → complete
@@ -790,7 +802,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 | Concern | Mechanism |
 |---|---|
 | Message + deliveries atomic | Single tx via `TxManager`; repositories join the tx from ctx (ADR 0005) |
-| Duplicate publish | `Idempotency-Key` PK `(project_id, key)` and fingerprint compare; insert blocks on the unique index under concurrency |
+| Duplicate publish | `Idempotency-Key` PK `(project_id, key)`, reserved first with `INSERT ... ON CONFLICT`, then a fingerprint compare. The loser blocks on the PK index, then replays (ADR 0013) |
 | Endpoint limit race (20/project) | Lock the `projects` row `FOR NO KEY UPDATE`, then count, then insert, as separate statements in one tx (`docs/plans/us-002.md` section 4) |
 | Concurrent PATCH | Per-field `COALESCE` update. The last writer wins per field, never across fields |
 | Two workers, one row | `FOR UPDATE SKIP LOCKED` claim plus a lease in `next_attempt_at` |
@@ -1001,19 +1013,17 @@ The Wire and library migration (ADR 0012) lands first as a behaviour-preserving 
 `CreateEndpoint`, `ListEndpoints`, `GetEndpoint`, `GetEndpointSecret`, `UpdateEndpoint`. Migration `0003_endpoints`.
 
 ### US-003: Publish
-1. `message/domain`: `message.go`, `idempotency.go` (`IdempotencyKey`, `Fingerprint`, `Reservation`, `Record`), `errors.go` (`ErrIdempotencyMismatch`), `repository.go` (`Repository{Create, Get, List, GetMany}`, `IdempotencyStore{Reserve, Find}`), `ports.go` (`EndpointDirectory`, `DeliveryScheduler`).
-2. `dispatch/domain`: `delivery.go` (`Delivery`, `Status`, `Trigger`, `NewPending`), `errors.go`, `repository.go` (`Repository{CreateMany}` for now). `dispatch/usecase/schedule_deliveries.go`.
-3. `endpoint/usecase/list_enabled_endpoint_ids.go` + `Directory.ListEnabledIDs`.
-4. `message/usecase/publish_message.go`: `PublishMessage{tx, messages, idem, endpoints, scheduler, ids, clock, ttl}`. Tests cover no key, new key, same key and same body (Replayed), same key and different body (`ErrIdempotencyMismatch`), 0 endpoints, scheduler error (whole thing fails).
-5. `migrations/0004_messages`, `0005_deliveries`. `message/data/postgres` (messages + idempotency store) and `dispatch/data/postgres` (`CreateDeliveries` via `unnest`). Integration tests: atomicity (inject a failure after the message insert, then assert 0 rows), 10 concurrent identical requests → 1 message, same key in two projects → 2 messages, payload bytes round-trip exactly.
-6. `message/delivery/http`: decode with `json.RawMessage` payload, syntactic checks, `Idempotency-Key` header validation, `202`, `Idempotent-Replayed: true`. The 413 comes from the global BodyLimit.
-7. Wiring: `adapters.go` → `endpointDirectory`, `deliveryScheduler`. Shared `TxManager`.
+Full layer-ordered plan, validation rules, transaction and AC → test map: [`docs/plans/us-003.md`](plans/us-003.md).
+Decisions: ADR 0013 (key reservation first; `message/data` reads `endpoints` and appends `deliveries`, so there are no
+adapters and no `dispatch` code yet). Use case: `PublishMessage`. Ports: `MessageRepository`, `IdempotencyStore`,
+`EndpointDirectory`, `DeliveryOutbox`, `Clock`, `IDGenerator`, `TxManager`. Migration `0004_messages`
+(`messages`, `idempotency_keys`, `deliveries`).
 
 ### US-004: Deliver with signatures
-1. `dispatch/domain`: `attempt.go` (`Attempt`, `AttemptError`), `outcome.go` (`Outcome`, `IsSuccess`, `IsTerminalFailure`), `signature.go` (`Sign`), `delivery.go` (`ApplyOutcome` with a retry policy of 0 delays for now), `repository.go` (+ `ClaimDue`, `CompleteAttempt`), `ports.go` (`Sender`, `EndpointCatalog.GetTargets`, `MessageCatalog.GetPayloads`), `ErrLeaseLost`.
+1. `dispatch/domain`: `attempt.go` (`Attempt`, `AttemptError`), `outcome.go` (`Outcome`, `IsSuccess`, `IsTerminalFailure`), `signature.go` (`Sign`), `delivery.go` (`ApplyOutcome` with a retry policy of 0 delays for now), `repository.go` (`ClaimDue`, `CompleteAttempt`; the `deliveries` table exists since 0004, and `message` creates its rows), `ports.go` (`Sender`, `EndpointCatalog.GetTargets`, `MessageCatalog.GetPayloads`), `ErrLeaseLost`.
 2. `dispatch/usecase`: `claim_due_deliveries.go`, `attempt_delivery.go`. Tests use a fake sender and clock: disabled → no send + `endpoint_disabled`; blocked → failed; 2xx → succeeded; headers and signature correct; lease lost is surfaced.
 3. `endpoint/usecase/get_delivery_targets.go`, `message/usecase/get_message_payloads.go` (+ repo methods).
-4. `migrations/0006_attempts`. `dispatch/data/postgres`: claim and complete queries. Integration tests: two concurrent claimers get disjoint rows; expired lease is reclaimed; stale completion → `ErrLeaseLost`.
+4. `migrations/0005_attempts`. `dispatch/data/postgres`: claim and complete queries. Integration tests: two concurrent claimers get disjoint rows; expired lease is reclaimed; stale completion → `ErrLeaseLost`.
 5. `library/netguard/dialer.go` (guarded `DialContext` + `Control`). `dispatch/data/webhookhttp/sender.go`: client, headers, 4 KB read, error classification. Tests cover 3xx, timeout, 1 MB body, blocked IP.
 6. `dispatch/delivery/worker/runner.go`: loop, free-slot claiming, errgroup, drain context, backoff on DB errors, health heartbeat.
 7. Wiring: `cmd/server/worker.go` (sender only built here), adapters `endpointCatalog`, `messageCatalog`. System test: 2 runners × 500 messages.
@@ -1044,7 +1054,7 @@ The Wire and library migration (ADR 0012) lands first as a behaviour-preserving 
 1. `demoreceiver/domain`: `plan.go` (`FailurePlan`), `verify.go` (`Verify`), `errors.go`, `repository.go` (`HitCounter`), `ports.go` (`SecretSource`).
 2. `demoreceiver/usecase/receive_webhook.go`. Tests cover stale timestamp, no candidates, wrong signature, fail_first boundary (n = N → fail, n = N+1 → ok).
 3. `endpoint/usecase/list_demo_signing_secrets.go` + `SecretReader.ListSecretsByURLPrefix`.
-4. `migrations/0007_demo_receiver_hits`. `demoreceiver/data/postgres` upsert counter. Integration test: concurrent increments are exact.
+4. `migrations/0006_demo_receiver_hits`. `demoreceiver/data/postgres` upsert counter. Integration test: concurrent increments are exact.
 5. HTTP: `POST /demo/receiver/{project_id}` (public, registered only if `DEMO_RECEIVER_ENABLED`). `GET /v1/project` mapper adds `demo_receiver_url`.
 6. `netguard` allowlist wiring. Seed extended: two demo endpoints (`fail_first=0`, `fail_first=2`) when the project is first created.
 7. System test: publish → flaky endpoint shows 500, 500, 200 with gaps of about 5 s and 30 s.

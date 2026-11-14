@@ -32,6 +32,9 @@ func TestLoad(t *testing.T) {
 		{name: "bad env", mutate: func(m map[string]string) { m["APP_ENV"] = "staging" }, wantErr: "APP_ENV"},
 		{name: "bad jitter", mutate: func(m map[string]string) { m["RETRY_JITTER"] = "1.5" }, wantErr: "RETRY_JITTER"},
 		{name: "lease too short", mutate: func(m map[string]string) { m["WORKER_LEASE_DURATION"] = "12s" }, wantErr: "WORKER_LEASE_DURATION"},
+		{name: "idempotency ttl of one second is accepted", mutate: func(m map[string]string) { m["IDEMPOTENCY_TTL"] = "1s" }},
+		{name: "idempotency ttl below one second", mutate: func(m map[string]string) { m["IDEMPOTENCY_TTL"] = "999ms" }, wantErr: "IDEMPOTENCY_TTL"},
+		{name: "idempotency ttl of one nanosecond", mutate: func(m map[string]string) { m["IDEMPOTENCY_TTL"] = "1ns" }, wantErr: "IDEMPOTENCY_TTL"},
 		{name: "prod needs https", mutate: func(m map[string]string) { m["APP_ENV"] = "production" }, wantErr: "https://"},
 	}
 	for _, tt := range tests {

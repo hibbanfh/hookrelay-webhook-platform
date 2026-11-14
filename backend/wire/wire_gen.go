@@ -20,6 +20,8 @@ import (
 	"hookrelay/internal/library/postgres"
 	"hookrelay/internal/library/random"
 	"hookrelay/internal/library/secretbox"
+	repositoryimpl3 "hookrelay/internal/message/data/repository"
+	usecase3 "hookrelay/internal/message/domain/usecase"
 	"hookrelay/internal/platform/config"
 	"hookrelay/internal/platform/httpx"
 	"hookrelay/internal/project/data/repository"
@@ -124,6 +126,31 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Handler: httppresenterHandler,
 		Guard:   projectGuard,
 	}
+	messagePersistentImpl := ProvideMessageSource(pool)
+	messageRepository := repositoryimpl3.NewMessageRepository(messagePersistentImpl)
+	idempotencyPersistentImpl := ProvideIdempotencySource(pool)
+	idempotencyStore := repositoryimpl3.NewIdempotencyStore(idempotencyPersistentImpl)
+	fanoutPersistentImpl := ProvideFanoutSource(pool)
+	endpointDirectory := repositoryimpl3.NewEndpointDirectory(fanoutPersistentImpl)
+	deliveryOutbox := repositoryimpl3.NewDeliveryOutbox(fanoutPersistentImpl)
+	idGenerator2 := ProvideMessageIDs(generator)
+	clock3 := ProvideMessageClock(system)
+	txManager2 := ProvideMessageTx(txManager)
+	publishMessageDeps := usecase3.PublishMessageDeps{
+		Messages:  messageRepository,
+		Keys:      idempotencyStore,
+		Endpoints: endpointDirectory,
+		Outbox:    deliveryOutbox,
+		IDs:       idGenerator2,
+		Clock:     clock3,
+		Tx:        txManager2,
+	}
+	publishMessage := ProvidePublishMessage(publishMessageDeps, cfg)
+	handler2 := ProvideMessageHandler(publishMessage, responder)
+	messageRoutes := MessageRoutes{
+		Handler: handler2,
+		Guard:   projectGuard,
+	}
 	routerDeps := RouterDeps{
 		Config:   cfg,
 		Log:      slogLogger,
@@ -132,6 +159,7 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Clock:    system,
 		Project:  projectRoutes,
 		Endpoint: endpointRoutes,
+		Message:  messageRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	api := &API{
@@ -230,6 +258,31 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Handler: httppresenterHandler,
 		Guard:   projectGuard,
 	}
+	messagePersistentImpl := ProvideMessageSource(pool)
+	messageRepository := repositoryimpl3.NewMessageRepository(messagePersistentImpl)
+	idempotencyPersistentImpl := ProvideIdempotencySource(pool)
+	idempotencyStore := repositoryimpl3.NewIdempotencyStore(idempotencyPersistentImpl)
+	fanoutPersistentImpl := ProvideFanoutSource(pool)
+	endpointDirectory := repositoryimpl3.NewEndpointDirectory(fanoutPersistentImpl)
+	deliveryOutbox := repositoryimpl3.NewDeliveryOutbox(fanoutPersistentImpl)
+	idGenerator2 := ProvideMessageIDs(generator)
+	clock3 := ProvideMessageClock(system)
+	txManager2 := ProvideMessageTx(txManager)
+	publishMessageDeps := usecase3.PublishMessageDeps{
+		Messages:  messageRepository,
+		Keys:      idempotencyStore,
+		Endpoints: endpointDirectory,
+		Outbox:    deliveryOutbox,
+		IDs:       idGenerator2,
+		Clock:     clock3,
+		Tx:        txManager2,
+	}
+	publishMessage := ProvidePublishMessage(publishMessageDeps, cfg)
+	handler2 := ProvideMessageHandler(publishMessage, responder)
+	messageRoutes := MessageRoutes{
+		Handler: handler2,
+		Guard:   projectGuard,
+	}
 	routerDeps := RouterDeps{
 		Config:   cfg,
 		Log:      log,
@@ -238,6 +291,7 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Clock:    system,
 		Project:  projectRoutes,
 		Endpoint: endpointRoutes,
+		Message:  messageRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	return httpHandler, nil
@@ -317,6 +371,6 @@ var infra = wire.NewSet(logger.ProviderSet, LoggerOptions, postgres.ProviderSet,
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet, httpclient.ProviderSet, HTTPClientOptions,
+	CoreSet, ProjectSet, EndpointSet, MessageSet, httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger, wire.Struct(new(RouterDeps), "*"), NewRouter,
 )

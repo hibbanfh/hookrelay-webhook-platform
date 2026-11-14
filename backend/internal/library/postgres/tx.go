@@ -38,13 +38,13 @@ type TxManager struct{ pool *pgxpool.Pool }
 // NewTxManager builds a TxManager on the pool.
 func NewTxManager(pool *pgxpool.Pool) *TxManager { return &TxManager{pool: pool} }
 
-// WithinTx begins a transaction (READ COMMITTED), runs fn with a context that carries it, and
+// WithinTx begins a READ COMMITTED transaction (asked for explicitly, whatever the role default is), runs fn with a context that carries it, and
 // commits when fn returns nil. Any error rolls back. A nested call joins the outer transaction.
 func (m *TxManager) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	if _, nested := ctx.Value(txKey{}).(pgx.Tx); nested {
 		return fn(ctx)
 	}
-	tx, err := m.pool.Begin(ctx)
+	tx, err := m.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}

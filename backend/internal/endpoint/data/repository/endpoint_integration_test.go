@@ -89,6 +89,9 @@ func (h harness) create(t *testing.T, projectID, id string, createdAt time.Time)
 
 func epID(n int) string { return fmt.Sprintf("ep_%026d", n) }
 
+// endpointsMigrationPredecessor is the schema version before 0003 created the endpoints table.
+const endpointsMigrationPredecessor = 2
+
 var base = time.Date(2026, 11, 9, 12, 0, 0, 123456000, time.UTC)
 
 func TestCreateThenGetAndRevealRoundTrip(t *testing.T) {
@@ -341,7 +344,8 @@ func TestEndpointsMigrationDownDropsTheTableAndUpRestoresIt(t *testing.T) {
 	ctx := context.Background()
 	h.create(t, projectA, epID(1), base)
 
-	downErr := postgres.Migrate(h.dsn, migrations.Files, postgres.Down)
+	// 0004 (deliveries) references endpoints, so move to version 2 to drop 0003 as well.
+	downErr := postgres.MigrateTo(h.dsn, migrations.Files, endpointsMigrationPredecessor)
 	var tableAfterDown *string
 	scanDown := h.pool.QueryRow(ctx, `SELECT to_regclass('endpoints')::text`).Scan(&tableAfterDown)
 	upErr := postgres.Migrate(h.dsn, migrations.Files, postgres.Up)

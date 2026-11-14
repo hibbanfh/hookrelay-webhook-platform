@@ -12,14 +12,16 @@ fail=0
 DOMAINS="project endpoint message dispatch demoreceiver"
 MOD="hookrelay/internal"
 
+# The helpers below use their own loop variable (dir): shell functions share scope with their
+# caller, so reusing d would overwrite the d of the caller loops further down.
 # check DESCRIPTION REGEX DIR...  (non-test Go files only; missing dirs are ignored)
 check() {
 	desc=$1
 	re=$2
 	shift 2
 	dirs=""
-	for d in "$@"; do
-		[ -d "$d" ] && dirs="$dirs $d"
+	for dir in "$@"; do
+		[ -d "$dir" ] && dirs="$dirs $dir"
 	done
 	[ -z "$dirs" ] && return 0
 	# shellcheck disable=SC2086
@@ -39,8 +41,8 @@ only() {
 	allow=$2
 	shift 2
 	dirs=""
-	for d in "$@"; do
-		[ -d "$d" ] && dirs="$dirs $d"
+	for dir in "$@"; do
+		[ -d "$dir" ] && dirs="$dirs $dir"
 	done
 	[ -z "$dirs" ] && return 0
 	# shellcheck disable=SC2086
@@ -138,6 +140,18 @@ check "nothing under internal may import the composition root" \
 check "a module must not import google/wire (provider sets live in backend/wire)" \
 	'"github.com/google/wire"' \
 	$(for d in $DOMAINS; do echo "internal/$d"; done) internal/platform
+
+# 5c. table ownership (ADR 0013): the message module reads endpoints and appends deliveries, and
+# only the statements in data/source/fanout_persistent.go may name tables of other modules.
+# The file is exempted by its full path, so a file with the same name elsewhere is still checked.
+out=$(grep -rniE --include='*.go' --exclude='*_test.go' \
+	'(FROM|JOIN|INTO|UPDATE)[[:space:]]+(endpoints|deliveries|projects|api_keys)([^a-z_]|$)' internal/message 2>/dev/null |
+	grep -v '^internal/message/data/source/fanout_persistent.go:')
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: message: SQL on another module's table outside data/source/fanout_persistent.go"
+	echo "$out"
+	fail=1
+fi
 
 # 6. go list based double check on the innermost layer, when domain packages exist:
 # transitive deps may only be stdlib or other domain/* packages of the same module.

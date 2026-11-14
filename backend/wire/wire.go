@@ -24,7 +24,7 @@ var infra = wire.NewSet(
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet,
+	CoreSet, ProjectSet, EndpointSet, MessageSet,
 	httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger,
 	wire.Struct(new(RouterDeps), "*"),

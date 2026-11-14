@@ -82,3 +82,44 @@ func TestDecodeJSONNamingFields(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeJSONBytes(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		naming    bool
+		wantOK    bool
+		wantField string
+	}{
+		{name: "one object", body: `{"name":"a"}`, wantOK: true},
+		{name: "empty", body: ``},
+		{name: "unknown field", body: `{"name":"a","x":1}`},
+		{name: "trailing value", body: `{"name":"a"}{"name":"b"}`},
+		{name: "trailing garbage", body: `{"name":"a"} x`},
+		{name: "wrong type stays generic", body: `{"name":5}`},
+		{name: "wrong type names the field", body: `{"name":5}`, naming: true, wantField: "name"},
+		{name: "syntax error stays generic when naming", body: `nope`, naming: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dst decodeBody
+			decode := httpx.DecodeJSONBytes
+			if tt.naming {
+				decode = httpx.DecodeJSONBytesNamingFields
+			}
+
+			err := decode([]byte(tt.body), &dst)
+
+			var apiErr *httpx.Error
+			if tt.wantOK {
+				if err != nil || dst.Name != "a" {
+					t.Fatalf("got %v %+v", err, dst)
+				}
+				return
+			}
+			if !errors.As(err, &apiErr) || apiErr.Status != 400 || apiErr.Field != tt.wantField {
+				t.Fatalf("got %v", err)
+			}
+		})
+	}
+}

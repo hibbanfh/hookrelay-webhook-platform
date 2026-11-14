@@ -117,3 +117,35 @@ func TestWithinTxReleasesTheConnectionWhenTheFunctionPanics(t *testing.T) {
 	conn.Release()
 	single.Close()
 }
+
+// The publish transaction relies on READ COMMITTED (ADR 0013), so WithinTx must ask for it
+// instead of inheriting whatever default the role or database has.
+func TestWithinTxIgnoresADifferentSessionDefaultIsolation(t *testing.T) {
+	_, dsn := pgtest.Start(t)
+	ctx := context.Background()
+	admin, err := postgres.Open(ctx, dsn, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	if _, err := admin.Exec(ctx, `ALTER ROLE CURRENT_USER SET default_transaction_isolation = 'repeatable read'`); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := postgres.Open(ctx, dsn, 2) // new connections pick up the role default
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var plain, inTx string
+	if err := pool.QueryRow(ctx, `SHOW transaction_isolation`).Scan(&plain); err != nil {
+		t.Fatal(err)
+	}
+
+	err = postgres.NewTxManager(pool).WithinTx(ctx, func(ctx context.Context) error {
+		return postgres.Executor(ctx, pool).QueryRow(ctx, `SHOW transaction_isolation`).Scan(&inTx)
+	})
+
+	if err != nil || plain != "repeatable read" || inTx != "read committed" {
+		t.Fatalf("err %v, session default %q, inside WithinTx %q", err, plain, inTx)
+	}
+}

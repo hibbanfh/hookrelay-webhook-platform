@@ -22,7 +22,9 @@ const (
 const (
 	requiredKeyBytes = 32
 	leaseMargin      = 5 * time.Second
-	seedKeyLength    = 46 // "hr_" + 43 base64url characters
+	// minIdempotencyTTL keeps expires_at strictly after created_at once both are stored with microsecond precision.
+	minIdempotencyTTL = time.Second
+	seedKeyLength     = 46 // "hr_" + 43 base64url characters
 )
 
 // Config is the typed, validated process configuration (architecture section 14).
@@ -120,6 +122,9 @@ func validateCross(c Config) error {
 	var errs []error
 	if c.WorkerLeaseDuration <= c.DeliveryTimeout+leaseMargin {
 		errs = append(errs, errors.New("WORKER_LEASE_DURATION must be greater than DELIVERY_TIMEOUT + 5s"))
+	}
+	if c.IdempotencyTTL < minIdempotencyTTL {
+		errs = append(errs, errors.New("IDEMPOTENCY_TTL must be at least 1s"))
 	}
 	if c.IsProduction() && !strings.HasPrefix(c.PublicBaseURL, "https://") {
 		errs = append(errs, errors.New("PUBLIC_BASE_URL must start with https:// in production"))
