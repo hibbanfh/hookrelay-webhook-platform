@@ -25,6 +25,14 @@ const getEndpointSQL = `SELECT ` + endpointColumns + ` FROM endpoints WHERE id =
 
 const getSecretSQL = `SELECT secret_ciphertext, secret_key_version FROM endpoints WHERE id = $1 AND project_id = $2`
 
+// getSealedTargetsSQL is a primary-key lookup for the delivery worker. It has no project scope on
+// purpose: the worker is a system reader and the composite foreign keys of deliveries keep it
+// from pairing a delivery with another project's endpoint.
+const getSealedTargetsSQL = `
+SELECT id, project_id, url, enabled, secret_ciphertext, secret_key_version
+FROM endpoints
+WHERE id = ANY($1::text[])`
+
 const listFirstPageSQL = `SELECT ` + endpointColumns + `
 FROM endpoints
 WHERE project_id = $1
@@ -80,6 +88,8 @@ type EndpointPersistent interface {
 	GetByID(ctx context.Context, projectID, id string) (model.Endpoint, error)
 	// GetSecretByID returns the sealed secret columns, or ErrNotFound.
 	GetSecretByID(ctx context.Context, projectID, id string) (model.EndpointSecret, error)
+	// GetSealedTargets returns the endpoints that exist among ids, with their sealed secrets.
+	GetSealedTargets(ctx context.Context, ids []string) ([]model.SealedTarget, error)
 	// List returns up to p.Limit rows, newest first, without the secret columns.
 	List(ctx context.Context, p ListParams) ([]model.Endpoint, error)
 	// Update changes the present fields and returns the stored row, or ErrNotFound.
@@ -125,6 +135,20 @@ func (s *EndpointPersistentImpl) GetSecretByID(ctx context.Context, projectID, i
 		return model.EndpointSecret{}, fmt.Errorf("query endpoint secret: %w", err)
 	}
 	return sec, nil
+}
+
+// GetSealedTargets loads the endpoints with the given IDs in one query. Unknown IDs are absent.
+func (s *EndpointPersistentImpl) GetSealedTargets(ctx context.Context, ids []string) ([]model.SealedTarget, error) {
+	rows, err := postgres.Executor(ctx, s.db).Query(ctx, getSealedTargetsSQL, ids)
+	if err != nil {
+		return nil, fmt.Errorf("query sealed targets: %w", err)
+	}
+	defer rows.Close()
+	out, err := pgx.CollectRows(rows, scanSealedTarget)
+	if err != nil {
+		return nil, fmt.Errorf("read sealed targets: %w", err)
+	}
+	return out, nil
 }
 
 // List returns one keyset page, served by endpoints_project_created_idx.
@@ -192,5 +216,11 @@ func scanEndpoint(row pgx.Row) (model.Endpoint, error) {
 func scanCollectable(row pgx.CollectableRow) (model.Endpoint, error) {
 	var m model.Endpoint
 	err := row.Scan(&m.ID, &m.ProjectID, &m.URL, &m.Description, &m.Enabled, &m.CreatedAt, &m.UpdatedAt)
+	return m, err
+}
+
+func scanSealedTarget(row pgx.CollectableRow) (model.SealedTarget, error) {
+	var m model.SealedTarget
+	err := row.Scan(&m.ID, &m.ProjectID, &m.URL, &m.Enabled, &m.Ciphertext, &m.KeyVersion)
 	return m, err
 }

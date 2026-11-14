@@ -23,13 +23,15 @@ var (
 
 // fakeSource records the calls and returns canned results.
 type fakeSource struct {
-	calls     []string
-	row       model.Endpoint
-	sealed    model.EndpointSecret
-	inserted  model.EndpointSecret
-	gotList   source.ListParams
-	gotUpdate source.UpdateParams
-	rows      []model.Endpoint
+	calls      []string
+	row        model.Endpoint
+	sealed     model.EndpointSecret
+	inserted   model.EndpointSecret
+	gotList    source.ListParams
+	gotUpdate  source.UpdateParams
+	rows       []model.Endpoint
+	targets    []model.SealedTarget
+	targetsErr error
 
 	insertErr, getErr, secretErr, listErr, updateErr, lockErr, countErr error
 	count                                                               int
@@ -46,6 +48,10 @@ func (f *fakeSource) GetByID(context.Context, string, string) (model.Endpoint, e
 
 func (f *fakeSource) GetSecretByID(context.Context, string, string) (model.EndpointSecret, error) {
 	return f.sealed, f.secretErr
+}
+
+func (f *fakeSource) GetSealedTargets(context.Context, []string) ([]model.SealedTarget, error) {
+	return f.targets, f.targetsErr
 }
 
 func (f *fakeSource) List(_ context.Context, p source.ListParams) ([]model.Endpoint, error) {

@@ -6,6 +6,7 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.18.3
 	github.com/google/wire v0.7.0
 	github.com/jackc/pgx/v5 v5.9.2
+	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
 	golang.org/x/sync v0.24.0

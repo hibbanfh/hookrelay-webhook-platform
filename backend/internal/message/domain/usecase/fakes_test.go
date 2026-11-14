@@ -56,6 +56,10 @@ func (f *fakeMessages) Create(_ context.Context, m entity.Message) error {
 	return f.createErr
 }
 
+func (f *fakeMessages) GetMany(context.Context, []string) ([]entity.Message, error) {
+	return nil, nil
+}
+
 func (f *fakeMessages) Get(_ context.Context, _, id string) (entity.Message, error) {
 	f.rec.add("get")
 	return f.stored[id], f.getErr

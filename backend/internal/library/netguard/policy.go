@@ -1,6 +1,6 @@
 // Package netguard decides whether a webhook destination may be registered (SSRF
 // protection, ADR 0003). Registration only resolves DNS and never calls the URL. The dial-time
-// guard that makes "the IP we check is the IP we dial" true arrives with delivery (US-004).
+// guard (dialer.go) makes "the IP we check is the IP we dial" true for delivery.
 package netguard
 
 import (
@@ -53,6 +53,9 @@ type Policy struct {
 	timeout       time.Duration
 	resolver      Resolver
 	blocked       []netip.Prefix
+	// connect opens the socket for a vetted address. Its Control hook re-checks the address the
+	// kernel is about to use. Tests replace it to see which address was dialed.
+	connect DialFunc
 }
 
 // New builds a Policy. It fails when an allowlist entry is not an absolute http(s) URL.
@@ -75,6 +78,7 @@ func New(o Options) (*Policy, error) {
 	if p.resolver == nil {
 		p.resolver = net.DefaultResolver
 	}
+	p.connect = (&net.Dialer{Control: p.controlCheck}).DialContext
 	return p, nil
 }
 

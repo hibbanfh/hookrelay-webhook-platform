@@ -23,12 +23,19 @@ SELECT id, project_id, event_type, payload, created_at
 FROM messages
 WHERE id = $1 AND project_id = $2`
 
+const getMessagesByIDsSQL = `
+SELECT id, project_id, event_type, payload, created_at
+FROM messages
+WHERE id = ANY($1::text[])`
+
 // MessagePersistent runs the messages table queries.
 type MessagePersistent interface {
 	// Insert stores a row.
 	Insert(ctx context.Context, m model.Message) error
 	// GetByID returns ErrNotFound when the project has no such message.
 	GetByID(ctx context.Context, projectID, id string) (model.Message, error)
+	// GetByIDs returns the rows that exist among ids, with no project scope.
+	GetByIDs(ctx context.Context, ids []string) ([]model.Message, error)
 }
 
 // MessagePersistentImpl implements MessagePersistent on PostgreSQL.
@@ -60,4 +67,24 @@ func (s *MessagePersistentImpl) GetByID(ctx context.Context, projectID, id strin
 		return model.Message{}, fmt.Errorf("query message: %w", err)
 	}
 	return m, nil
+}
+
+// GetByIDs loads the messages with the given IDs in one primary-key query.
+func (s *MessagePersistentImpl) GetByIDs(ctx context.Context, ids []string) ([]model.Message, error) {
+	rows, err := postgres.Executor(ctx, s.db).Query(ctx, getMessagesByIDsSQL, ids)
+	if err != nil {
+		return nil, fmt.Errorf("query messages: %w", err)
+	}
+	defer rows.Close()
+	out, err := pgx.CollectRows(rows, scanMessage)
+	if err != nil {
+		return nil, fmt.Errorf("read messages: %w", err)
+	}
+	return out, nil
+}
+
+func scanMessage(row pgx.CollectableRow) (model.Message, error) {
+	var m model.Message
+	err := row.Scan(&m.ID, &m.ProjectID, &m.EventType, &m.Payload, &m.CreatedAt)
+	return m, err
 }

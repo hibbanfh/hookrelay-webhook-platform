@@ -37,3 +37,16 @@ func (r *MessageRepositoryImpl) Get(ctx context.Context, projectID, id string) (
 	}
 	return toMessageEntity(m), nil
 }
+
+// GetMany loads the messages that exist among ids in one query.
+func (r *MessageRepositoryImpl) GetMany(ctx context.Context, ids []string) ([]entity.Message, error) {
+	rows, err := r.source.GetByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]entity.Message, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, toMessageEntity(m))
+	}
+	return out, nil
+}

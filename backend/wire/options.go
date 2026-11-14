@@ -4,6 +4,8 @@ import (
 	"net"
 	"os"
 
+	"hookrelay/internal/dispatch/data/webhookhttp"
+	"hookrelay/internal/dispatch/delivery/worker"
 	"hookrelay/internal/library/httpclient"
 	"hookrelay/internal/library/logger"
 	"hookrelay/internal/library/netguard"
@@ -28,6 +30,27 @@ const (
 	WorkerPoolSize PoolSize = 6
 	SeedPoolSize   PoolSize = 2
 )
+
+// BuildVersion is the version stamped into the binary (main.version). It identifies Hookrelay
+// to receivers in the User-Agent header.
+type BuildVersion string
+
+// userAgentRepoURL is a placeholder until the repository is public (open question Q18).
+const userAgentRepoURL = "https://github.com/hookrelay/hookrelay"
+
+// UserAgent builds the User-Agent that identifies Hookrelay to receivers.
+func UserAgent(v BuildVersion) webhookhttp.UserAgent {
+	return webhookhttp.UserAgent("Hookrelay/" + string(v) + " (+" + userAgentRepoURL + ")")
+}
+
+// WorkerOptions maps the configuration to the worker loop.
+func WorkerOptions(cfg config.Config) worker.Config {
+	return worker.Config{
+		Concurrency:     cfg.WorkerConcurrency,
+		PollInterval:    cfg.WorkerPollInterval,
+		ShutdownTimeout: cfg.WorkerShutdownTimeout,
+	}
+}
 
 // LoggerOptions maps the configuration to the logger library.
 func LoggerOptions(cfg config.Config, process ProcessName) logger.Options {

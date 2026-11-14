@@ -10,8 +10,10 @@ import (
 	"github.com/google/wire"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"hookrelay/internal/dispatch/delivery/worker"
 	"hookrelay/internal/library/httpclient"
 	"hookrelay/internal/library/logger"
+	"hookrelay/internal/library/netguard"
 	"hookrelay/internal/library/postgres"
 	"hookrelay/internal/platform/config"
 )
@@ -31,6 +33,9 @@ var routerSet = wire.NewSet(
 	NewRouter,
 )
 
+// runnerSet is the worker graph below the logger and the pool. The API graph never includes it.
+var runnerSet = wire.NewSet(CoreSet, EndpointTargetsSet, MessagePayloadsSet, DispatchSet)
+
 // InitializeAPI builds the API process.
 func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error) {
 	wire.Build(infra, routerSet, wire.Value(APIProcess), wire.Value(APIPoolSize), wire.Struct(new(API), "*"))
@@ -44,9 +49,16 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 }
 
 // InitializeWorker builds the worker process.
-func InitializeWorker(ctx context.Context, cfg config.Config) (*Worker, func(), error) {
-	wire.Build(infra, WorkerMux, wire.Value(WorkerProcess), wire.Value(WorkerPoolSize), wire.Struct(new(Worker), "*"))
+func InitializeWorker(ctx context.Context, cfg config.Config, version BuildVersion) (*Worker, func(), error) {
+	wire.Build(infra, runnerSet, NetguardOptions, WorkerMux, wire.Value(WorkerProcess), wire.Value(WorkerPoolSize), wire.Struct(new(Worker), "*"))
 	return nil, nil, nil
+}
+
+// InitializeRunner builds the delivery runner on a logger and pool the caller supplies, with the
+// SSRF options given explicitly so a test can run in production mode with a fake resolver.
+func InitializeRunner(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, ng netguard.Options, version BuildVersion) (*worker.Runner, error) {
+	wire.Build(runnerSet, postgres.NewTxManager)
+	return nil, nil
 }
 
 // InitializeSeed builds the seed process.

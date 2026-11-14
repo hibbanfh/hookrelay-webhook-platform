@@ -6,6 +6,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"hookrelay/internal/dispatch/delivery/worker"
 	"hookrelay/internal/library/ids"
 	"hookrelay/internal/platform/config"
 	"hookrelay/internal/platform/health"
@@ -45,10 +46,11 @@ func NewRouter(d RouterDeps) http.Handler {
 	)
 }
 
-// WorkerMux serves the worker's private health endpoint.
-func WorkerMux(pool *pgxpool.Pool) http.Handler {
+// WorkerMux serves the private health endpoint of the worker: it is healthy only while the
+// database answers and a claim has completed recently.
+func WorkerMux(pool *pgxpool.Pool, beat *worker.Heartbeat) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", health.Handler(pool))
+	mux.HandleFunc("GET /healthz", health.Handler(health.All(pool, beat)))
 	return mux
 }
 

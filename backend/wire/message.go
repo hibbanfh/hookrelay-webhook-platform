@@ -29,17 +29,27 @@ func (m MessageRoutes) Register(mux *http.ServeMux) {
 	messagehttp.Routes(mux, m.Handler, m.Guard)
 }
 
+// messageDataSet is the message storage the API and the worker graph share.
+var messageDataSet = wire.NewSet(
+	ProvideMessageSource,
+	wire.Bind(new(messagesource.MessagePersistent), new(*messagesource.MessagePersistentImpl)),
+	messagerepo.NewMessageRepository,
+)
+
+// MessagePayloadsSet is what the worker needs from the message module: the internal use case
+// that reads payloads by ID (ADR 0014 section 4).
+var MessagePayloadsSet = wire.NewSet(messageDataSet, messageuc.NewGetMessagePayloads)
+
 // MessageSet builds the message module and binds the libraries to its ports. The message module
 // reads endpoints and appends deliveries through its own repositories (ADR 0013), so it needs no
 // adapter in adapters.go.
 var MessageSet = wire.NewSet(
+	messageDataSet,
 	ProvideMessageClock, ProvideMessageIDs, ProvideMessageTx,
 
-	ProvideMessageSource, ProvideIdempotencySource, ProvideFanoutSource,
-	wire.Bind(new(messagesource.MessagePersistent), new(*messagesource.MessagePersistentImpl)),
+	ProvideIdempotencySource, ProvideFanoutSource,
 	wire.Bind(new(messagesource.IdempotencyPersistent), new(*messagesource.IdempotencyPersistentImpl)),
 	wire.Bind(new(messagesource.FanoutPersistent), new(*messagesource.FanoutPersistentImpl)),
-	messagerepo.NewMessageRepository,
 	messagerepo.NewIdempotencyStore,
 	messagerepo.NewEndpointDirectory,
 	messagerepo.NewDeliveryOutbox,

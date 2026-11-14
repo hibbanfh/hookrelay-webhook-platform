@@ -12,6 +12,10 @@ import (
 
 const usage = "usage: hookrelay <api|worker|migrate up|migrate down|seed>"
 
+// version is stamped at build time with -ldflags "-X main.version=..." and identifies Hookrelay
+// to receivers in the User-Agent header. It is the one global of the binary.
+var version = "dev"
+
 func main() {
 	os.Exit(realMain())
 }

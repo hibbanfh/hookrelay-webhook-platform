@@ -32,13 +32,5 @@ func (r *SecretReaderImpl) GetSecret(ctx context.Context, projectID, id string) 
 	if err != nil {
 		return entity.SigningSecret{}, fmt.Errorf("get sealed secret of %s: %w", id, err)
 	}
-	key, err := r.cipher.Open(sealed.Ciphertext, []byte(id), sealed.KeyVersion)
-	if err != nil {
-		return entity.SigningSecret{}, fmt.Errorf("open signing secret of %s: %w", id, err)
-	}
-	secret, err := entity.NewSigningSecret(key)
-	if err != nil {
-		return entity.SigningSecret{}, fmt.Errorf("decode signing secret of %s: %w", id, err)
-	}
-	return secret, nil
+	return openSecret(r.cipher, id, sealed)
 }

@@ -10,6 +10,9 @@ import (
 	"context"
 	"github.com/google/wire"
 	"github.com/jackc/pgx/v5/pgxpool"
+	repositoryimpl4 "hookrelay/internal/dispatch/data/repository"
+	"hookrelay/internal/dispatch/delivery/worker"
+	usecase4 "hookrelay/internal/dispatch/domain/usecase"
 	repositoryimpl2 "hookrelay/internal/endpoint/data/repository"
 	usecase2 "hookrelay/internal/endpoint/domain/usecase"
 	"hookrelay/internal/library/clock"
@@ -298,22 +301,84 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 }
 
 // InitializeWorker builds the worker process.
-func InitializeWorker(ctx context.Context, cfg config.Config) (*Worker, func(), error) {
+func InitializeWorker(ctx context.Context, cfg config.Config, version BuildVersion) (*Worker, func(), error) {
 	poolSize := _wireWirePoolSizeValue
 	options := PostgresOptions(cfg, poolSize)
 	pool, cleanup, err := postgres.ProvidePool(ctx, options)
 	if err != nil {
 		return nil, nil, err
 	}
-	handler := WorkerMux(pool)
+	system := clock.NewSystem()
+	heartbeat := ProvideHeartbeat(system)
+	handler := WorkerMux(pool, heartbeat)
 	processName := _wireWireProcessNameValue
 	loggerOptions := LoggerOptions(cfg, processName)
 	slogLogger := logger.Provide(loggerOptions)
-	worker := &Worker{
+	deliveryPersistentImpl := ProvideDeliverySource(pool)
+	repositoryimplClock := ProvideQueueClock(system)
+	deliveryQueue := repositoryimpl4.NewDeliveryQueue(deliveryPersistentImpl, repositoryimplClock)
+	endpointPersistentImpl := ProvideEndpointSource(pool)
+	secretboxOptions := SecretboxOptions(cfg)
+	box, err := secretbox.New(secretboxOptions)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	deliveryTargetReader := repositoryimpl2.NewDeliveryTargetReader(endpointPersistentImpl, box)
+	getDeliveryTargets := usecase2.NewGetDeliveryTargets(deliveryTargetReader)
+	repositoryEndpointCatalog := ProvideEndpointCatalog(getDeliveryTargets)
+	messagePersistentImpl := ProvideMessageSource(pool)
+	messageRepository := repositoryimpl3.NewMessageRepository(messagePersistentImpl)
+	getMessagePayloads := usecase3.NewGetMessagePayloads(messageRepository)
+	repositoryMessageCatalog := ProvideMessageCatalog(getMessagePayloads)
+	generator := ids.NewCryptoGenerator(system)
+	idGenerator := ProvideDispatchIDs(generator)
+	usecaseClock := ProvideDispatchClock(system)
+	claimDueDeliveriesDeps := usecase4.ClaimDueDeliveriesDeps{
+		Queue:     deliveryQueue,
+		Endpoints: repositoryEndpointCatalog,
+		Messages:  repositoryMessageCatalog,
+		IDs:       idGenerator,
+		Clock:     usecaseClock,
+	}
+	claimDueDeliveries := ProvideClaimDueDeliveries(claimDueDeliveriesDeps, cfg)
+	attemptPersistentImpl := ProvideAttemptSource(pool)
+	attemptRepository := repositoryimpl4.NewAttemptRepository(attemptPersistentImpl)
+	netguardOptions := NetguardOptions(cfg)
+	policy, err := netguard.New(netguardOptions)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	userAgent := UserAgent(version)
+	sender := ProvideSender(policy, cfg, userAgent)
+	retryPlanner := ProvideRetryPlanner()
+	txManager := postgres.NewTxManager(pool)
+	usecaseTxManager := ProvideDispatchTx(txManager)
+	attemptDeliveryDeps := usecase4.AttemptDeliveryDeps{
+		Queue:    deliveryQueue,
+		Attempts: attemptRepository,
+		Sender:   sender,
+		Retry:    retryPlanner,
+		IDs:      idGenerator,
+		Clock:    usecaseClock,
+		Tx:       usecaseTxManager,
+	}
+	attemptDelivery := ProvideAttemptDelivery(attemptDeliveryDeps)
+	deps := worker.Deps{
+		Claim:     claimDueDeliveries,
+		Attempt:   attemptDelivery,
+		Log:       slogLogger,
+		Heartbeat: heartbeat,
+	}
+	workerConfig := WorkerOptions(cfg)
+	runner := worker.NewRunner(deps, workerConfig)
+	wireWorker := &Worker{
 		Handler: handler,
 		Log:     slogLogger,
+		Runner:  runner,
 	}
-	return worker, func() {
+	return wireWorker, func() {
 		cleanup()
 	}, nil
 }
@@ -322,6 +387,70 @@ var (
 	_wireWirePoolSizeValue    = WorkerPoolSize
 	_wireWireProcessNameValue = WorkerProcess
 )
+
+// InitializeRunner builds the delivery runner on a logger and pool the caller supplies, with the
+// SSRF options given explicitly so a test can run in production mode with a fake resolver.
+func InitializeRunner(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, ng netguard.Options, version BuildVersion) (*worker.Runner, error) {
+	deliveryPersistentImpl := ProvideDeliverySource(pool)
+	system := clock.NewSystem()
+	repositoryimplClock := ProvideQueueClock(system)
+	deliveryQueue := repositoryimpl4.NewDeliveryQueue(deliveryPersistentImpl, repositoryimplClock)
+	endpointPersistentImpl := ProvideEndpointSource(pool)
+	options := SecretboxOptions(cfg)
+	box, err := secretbox.New(options)
+	if err != nil {
+		return nil, err
+	}
+	deliveryTargetReader := repositoryimpl2.NewDeliveryTargetReader(endpointPersistentImpl, box)
+	getDeliveryTargets := usecase2.NewGetDeliveryTargets(deliveryTargetReader)
+	repositoryEndpointCatalog := ProvideEndpointCatalog(getDeliveryTargets)
+	messagePersistentImpl := ProvideMessageSource(pool)
+	messageRepository := repositoryimpl3.NewMessageRepository(messagePersistentImpl)
+	getMessagePayloads := usecase3.NewGetMessagePayloads(messageRepository)
+	repositoryMessageCatalog := ProvideMessageCatalog(getMessagePayloads)
+	generator := ids.NewCryptoGenerator(system)
+	idGenerator := ProvideDispatchIDs(generator)
+	usecaseClock := ProvideDispatchClock(system)
+	claimDueDeliveriesDeps := usecase4.ClaimDueDeliveriesDeps{
+		Queue:     deliveryQueue,
+		Endpoints: repositoryEndpointCatalog,
+		Messages:  repositoryMessageCatalog,
+		IDs:       idGenerator,
+		Clock:     usecaseClock,
+	}
+	claimDueDeliveries := ProvideClaimDueDeliveries(claimDueDeliveriesDeps, cfg)
+	attemptPersistentImpl := ProvideAttemptSource(pool)
+	attemptRepository := repositoryimpl4.NewAttemptRepository(attemptPersistentImpl)
+	policy, err := netguard.New(ng)
+	if err != nil {
+		return nil, err
+	}
+	userAgent := UserAgent(version)
+	sender := ProvideSender(policy, cfg, userAgent)
+	retryPlanner := ProvideRetryPlanner()
+	txManager := postgres.NewTxManager(pool)
+	usecaseTxManager := ProvideDispatchTx(txManager)
+	attemptDeliveryDeps := usecase4.AttemptDeliveryDeps{
+		Queue:    deliveryQueue,
+		Attempts: attemptRepository,
+		Sender:   sender,
+		Retry:    retryPlanner,
+		IDs:      idGenerator,
+		Clock:    usecaseClock,
+		Tx:       usecaseTxManager,
+	}
+	attemptDelivery := ProvideAttemptDelivery(attemptDeliveryDeps)
+	heartbeat := ProvideHeartbeat(system)
+	deps := worker.Deps{
+		Claim:     claimDueDeliveries,
+		Attempt:   attemptDelivery,
+		Log:       log,
+		Heartbeat: heartbeat,
+	}
+	workerConfig := WorkerOptions(cfg)
+	runner := worker.NewRunner(deps, workerConfig)
+	return runner, nil
+}
 
 // InitializeSeed builds the seed process.
 func InitializeSeed(ctx context.Context, cfg config.Config) (*Seed, func(), error) {
@@ -374,3 +503,6 @@ var routerSet = wire.NewSet(
 	CoreSet, ProjectSet, EndpointSet, MessageSet, httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger, wire.Struct(new(RouterDeps), "*"), NewRouter,
 )
+
+// runnerSet is the worker graph below the logger and the pool. The API graph never includes it.
+var runnerSet = wire.NewSet(CoreSet, EndpointTargetsSet, MessagePayloadsSet, DispatchSet)

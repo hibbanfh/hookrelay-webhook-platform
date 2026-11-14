@@ -153,6 +153,28 @@ if [ -n "$out" ]; then
 	fail=1
 fi
 
+# 5d. table ownership (ADR 0014): dispatch owns deliveries and attempts only. The endpoint secrets
+# and the message payloads reach it through the catalog ports and the adapters in backend/wire.
+out=$(grep -rnE --include='*.go' --exclude='*_test.go' 	'(FROM|JOIN|INTO|UPDATE)[[:space:]]+(endpoints|messages|projects|api_keys|idempotency_keys)([^a-z_]|$)' internal/dispatch 2>/dev/null)
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: dispatch: SQL on another module's table (ADR 0014)"
+	echo "$out"
+	fail=1
+fi
+
+# 5e. the dispatch adapters that are not data/{model,source,repository} (ADR 0014).
+only "dispatch: data/webhookhttp imports domain/{entity,errors} and library/netguard only" 	"$MOD/dispatch/domain/(entity|errors)|$MOD/library/netguard" 	internal/dispatch/data/webhookhttp
+only "dispatch: delivery/worker imports domain/{usecase,entity,errors} and x/sync only (never data)" 	"$MOD/dispatch/domain/(usecase|entity|errors)|golang.org/x/sync" 	internal/dispatch/delivery/worker
+
+# 5f. the API process must not be able to make an outbound call (ADR 0002): its injectors never
+# mention the sender, the worker or the dispatch module.
+out=$(awk '/^func Initialize(API|Router)\(/,/^}/' wire/wire_gen.go | grep -nE 'webhookhttp|ProvideSender|Dispatch|dispatch|worker\.|Heartbeat')
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: the API graph in wire/wire_gen.go references the delivery worker (ADR 0002)"
+	echo "$out"
+	fail=1
+fi
+
 # 6. go list based double check on the innermost layer, when domain packages exist:
 # transitive deps may only be stdlib or other domain/* packages of the same module.
 for pkg in $(go list ./internal/*/domain/... 2>/dev/null); do

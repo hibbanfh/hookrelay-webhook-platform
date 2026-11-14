@@ -271,7 +271,9 @@ Notes / out of scope:
 
 ---
 
-### US-004: Deliver messages asynchronously with signed payloads            [status: todo]  [priority: P0]
+### US-004: Deliver messages asynchronously with signed payloads            [status: done]  [priority: P0]
+
+> **Done 2026-11-14.** All 11 criteria PASS live on the real binaries (separate `api` and two `worker` processes) against real PostgreSQL with a recording receiver that verifies every request with the Standard Webhooks reference library (flipped byte fails): delivery 120 ms after publish; byte-for-byte body; 500 messages over two worker processes each delivered exactly once; `kill -9` mid-flight recovered and `succeeded` (36 s); SIGTERM drains and exits 0; production `destination_blocked` via a hostname re-pointed to 127.0.0.1. Plus unit, Testcontainers integration and process tests: `go test -race -tags integration ./...` in a Linux container, 406 PASS / 0 FAIL. No bugs filed. Review approved after two fix rounds (claim survives SIGTERM, shutdown deadline armed at the signal so total ≤ `WORKER_SHUTDOWN_TIMEOUT` + 3 s, heartbeat on a saturated worker, unreadable-secret cause logged). Decisions: ADR 0014 (500 ms polling, lease in `next_attempt_at`, fenced completion). Open: until US-005 every non-2xx is final; architecture §18 Q14–Q18 (no attempt row for a SIGKILLed attempt, `endpoint_disabled` recorded as an attempt, stored 4 KB response bodies, placeholder User-Agent URL) taken with the architect's defaults; `govulncheck` reported one Go standard-library advisory still to be inspected.
 As an integrator receiving webhooks, I want each delivery signed with my endpoint's secret
 in a standard format, so that I can prove it came from the sender and wasn't tampered with.
 

@@ -22,10 +22,22 @@ const (
 const (
 	requiredKeyBytes = 32
 	leaseMargin      = 5 * time.Second
+	// The poll interval is the first-delivery latency (the US-004 budget is 5 s) and, when idle,
+	// the number of claim queries per second. Outside this range it is a mistake in either direction.
+	minPollInterval = 50 * time.Millisecond
+	maxPollInterval = 2 * time.Second
 	// minIdempotencyTTL keeps expires_at strictly after created_at once both are stored with microsecond precision.
 	minIdempotencyTTL = time.Second
 	seedKeyLength     = 46 // "hr_" + 43 base64url characters
 )
+
+// WorkerHeartbeatMaxAge is how long the worker may go without a claim or a finished attempt
+// before its health endpoint fails. DELIVERY_TIMEOUT plus the completion budget must fit in it.
+const WorkerHeartbeatMaxAge = 30 * time.Second
+
+// WorkerCompletionTimeout bounds recording an attempt (the completion transaction). It is the
+// one value behind the shutdown budget (shutdown timeout + this) and the heartbeat window.
+const WorkerCompletionTimeout = 3 * time.Second
 
 // Config is the typed, validated process configuration (architecture section 14).
 type Config struct {
@@ -122,6 +134,12 @@ func validateCross(c Config) error {
 	var errs []error
 	if c.WorkerLeaseDuration <= c.DeliveryTimeout+leaseMargin {
 		errs = append(errs, errors.New("WORKER_LEASE_DURATION must be greater than DELIVERY_TIMEOUT + 5s"))
+	}
+	if c.WorkerPollInterval < minPollInterval || c.WorkerPollInterval > maxPollInterval {
+		errs = append(errs, errors.New("WORKER_POLL_INTERVAL must be between 50ms and 2s"))
+	}
+	if c.DeliveryTimeout+WorkerCompletionTimeout >= WorkerHeartbeatMaxAge {
+		errs = append(errs, errors.New("DELIVERY_TIMEOUT + 3s must be below the 30s worker heartbeat window, or a healthy saturated worker reports unhealthy"))
 	}
 	if c.IdempotencyTTL < minIdempotencyTTL {
 		errs = append(errs, errors.New("IDEMPOTENCY_TTL must be at least 1s"))

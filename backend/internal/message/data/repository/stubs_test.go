@@ -16,6 +16,7 @@ var storedAt = time.Date(2026, 11, 13, 16, 30, 0, 123456000, time.FixedZone("UTC
 type stubMessages struct {
 	inserted []model.Message
 	row      model.Message
+	rows     []model.Message
 	err      error
 }
 
@@ -26,6 +27,10 @@ func (s *stubMessages) Insert(_ context.Context, m model.Message) error {
 
 func (s *stubMessages) GetByID(context.Context, string, string) (model.Message, error) {
 	return s.row, s.err
+}
+
+func (s *stubMessages) GetByIDs(context.Context, []string) ([]model.Message, error) {
+	return s.rows, s.err
 }
 
 type stubKeys struct {

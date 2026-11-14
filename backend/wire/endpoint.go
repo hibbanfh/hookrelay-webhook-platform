@@ -33,18 +33,33 @@ func (e EndpointRoutes) Register(mux *http.ServeMux) {
 	endpointhttp.Routes(mux, e.Handler, e.Guard)
 }
 
+// endpointDataSet is the storage half of the endpoint module: the source and the secret cipher.
+// The API and the worker graph both build on it, and neither needs the other's half.
+var endpointDataSet = wire.NewSet(
+	secretbox.ProviderSet, SecretboxOptions,
+	wire.Bind(new(endpointrepository.SecretCipher), new(*secretbox.Box)),
+	ProvideEndpointSource,
+	wire.Bind(new(endpointsource.EndpointPersistent), new(*endpointsource.EndpointPersistentImpl)),
+)
+
+// EndpointTargetsSet is what the worker needs from the endpoint module: the internal use case
+// that reads endpoints with their decrypted secrets (ADR 0014 section 4). It has no handler,
+// no routes and no URL policy.
+var EndpointTargetsSet = wire.NewSet(
+	endpointDataSet,
+	endpointrepo.NewDeliveryTargetReader,
+	endpointuc.NewGetDeliveryTargets,
+)
+
 // EndpointSet builds the endpoint module and binds the libraries to its ports.
 var EndpointSet = wire.NewSet(
+	endpointDataSet,
 	ProvideEndpointClock, ProvideEndpointIDs, ProvideEndpointRandom,
 
 	ProvideEndpointTx,
-	secretbox.ProviderSet, SecretboxOptions,
-	wire.Bind(new(endpointrepository.SecretCipher), new(*secretbox.Box)),
 	netguard.ProviderSet, NetguardOptions,
 	wire.Bind(new(endpointrepository.URLPolicy), new(*netguard.Policy)),
 
-	ProvideEndpointSource,
-	wire.Bind(new(endpointsource.EndpointPersistent), new(*endpointsource.EndpointPersistentImpl)),
 	endpointrepo.NewEndpointRepository,
 	endpointrepo.NewSecretReader,
 

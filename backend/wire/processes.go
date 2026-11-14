@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"hookrelay/internal/dispatch/delivery/worker"
 	projectuc "hookrelay/internal/project/domain/usecase"
 )
 
@@ -17,6 +18,7 @@ type API struct {
 type Worker struct {
 	Handler http.Handler
 	Log     *slog.Logger
+	Runner  *worker.Runner
 }
 
 // Seed is the object graph of the seed subcommand.

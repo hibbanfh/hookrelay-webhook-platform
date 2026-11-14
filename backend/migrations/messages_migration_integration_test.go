@@ -4,6 +4,7 @@ package migrations_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -11,6 +12,12 @@ import (
 	"hookrelay/internal/library/postgres"
 	"hookrelay/internal/testsupport/pgtest"
 	"hookrelay/migrations"
+)
+
+// The migration versions this test moves between.
+const (
+	messagesMigration            uint = 4
+	messagesMigrationPredecessor uint = 3
 )
 
 var messageTables = []string{"messages", "idempotency_keys", "deliveries"}
@@ -59,20 +66,22 @@ func TestMessagesMigrationUpDownUpDownUp(t *testing.T) {
 	assertTables(t, pool, true, "after the first up")
 	seedRows(t, pool)
 
+	// 0005 (attempts) references deliveries, so the messages migration is reached by version
+	// instead of by counting Down steps.
 	steps := []struct {
-		dir         postgres.Direction
+		version     uint
 		wantPresent bool
 	}{
-		{postgres.Down, false}, {postgres.Up, true}, {postgres.Down, false}, {postgres.Up, true},
+		{messagesMigrationPredecessor, false}, {messagesMigration, true}, {messagesMigrationPredecessor, false}, {messagesMigration, true},
 	}
 	if !tablePresent(t, pool, "idempotency_keys_message_idx") {
 		t.Fatal("the message foreign key of idempotency_keys needs its index (US-016 deletes messages)")
 	}
 	for _, s := range steps {
-		if err := postgres.Migrate(dsn, migrations.Files, s.dir); err != nil {
-			t.Fatalf("migrate %s: %v", s.dir, err)
+		if err := postgres.MigrateTo(dsn, migrations.Files, s.version); err != nil {
+			t.Fatalf("migrate to %d: %v", s.version, err)
 		}
-		assertTables(t, pool, s.wantPresent, "after "+string(s.dir))
+		assertTables(t, pool, s.wantPresent, fmt.Sprintf("after migrating to %d", s.version))
 	}
 	if !tablePresent(t, pool, "endpoints") || !tablePresent(t, pool, "projects") {
 		t.Fatal("the down migration must leave projects and endpoints alone")
