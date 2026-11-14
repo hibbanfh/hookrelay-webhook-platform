@@ -352,15 +352,30 @@ export interface webhooks {
         put?: never;
         /**
          * What Hookrelay sends to a registered endpoint
-         * @description One request per delivery attempt. Signed with the endpoint's secret using the
+         * @description One `POST` per delivery attempt, sent by the worker process (never by the API), usually within
+         *     a second of publish. Signed with the endpoint's secret using the
          *     [Standard Webhooks](https://www.standardwebhooks.com/) scheme:
          *     `webhook-signature: v1,<base64(HMAC-SHA256(key, "{webhook-id}.{webhook-timestamp}.{body}"))>`,
-         *     where `key` is the base64-decoded part of `whsec_<base64>`. Multiple signatures may be space-separated
-         *     (reserved for secret rotation, P1).
+         *     where `key` is the base64-decoded part of `whsec_<base64>` and `body` is the raw request body.
+         *     Multiple signatures may be space-separated (reserved for secret rotation, P1).
          *
-         *     Success is any `2xx` within the timeout (10 s by default). Redirects are not followed. The body is the
-         *     published payload, byte-for-byte. `webhook-id` is the message ID and is stable across retries and replays,
-         *     so receivers can deduplicate (delivery is at-least-once).
+         *     **Verifying:** read the raw body bytes before any JSON parsing, recompute the signature with a
+         *     constant-time compare, and reject timestamps more than 5 minutes from your clock. Any Standard
+         *     Webhooks library does all three.
+         *
+         *     **Request:** the body is the published `payload`, byte-for-byte (whitespace and key order kept).
+         *     Header names are sent in lowercase as the spec writes them (HTTP header names are case-insensitive).
+         *     `content-type` is exactly `application/json`. `webhook-id` is the message ID: the same for every endpoint,
+         *     retry and replay of that message, so receivers can deduplicate. Delivery is at-least-once (a worker crash
+         *     can cause a repeat), and ordering is not guaranteed, not even per endpoint.
+         *
+         *     **Outcome:** any `2xx` within the timeout (10 s by default, `DELIVERY_TIMEOUT`) is a success. Redirects
+         *     (`3xx`) are not followed and count as failures, like every other status. The first 4 KB of the response
+         *     body are stored on the attempt (`GET /v1/deliveries/{delivery_id}/attempts`), so do not echo secrets in it.
+         *     No request is sent at all when the endpoint is disabled (attempt error `endpoint_disabled`) or when, in
+         *     production, its host resolves to a private or otherwise blocked address at send time (attempt error
+         *     `destination_blocked`; the destination is checked when the connection is opened, not only at registration).
+         *     Both are terminal: the delivery becomes `failed` and is not retried.
          */
         post: {
             parameters: {
@@ -368,31 +383,43 @@ export interface webhooks {
                 header: {
                     /** @description The message ID. Stable across retries and replays. */
                     "webhook-id": components["parameters"]["WebhookIDHeader"];
-                    /** @description Unix seconds at send time (fresh for every attempt). */
+                    /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
                     "webhook-timestamp": components["parameters"]["WebhookTimestampHeader"];
                     /** @description Space-separated list of `v1,<base64 signature>`. */
                     "webhook-signature": components["parameters"]["WebhookSignatureHeader"];
+                    /** @description Identifies Hookrelay. Always starts with `Hookrelay/` followed by the build version. */
                     "User-Agent": string;
                 };
                 path?: never;
                 cookie?: never;
             };
+            /** @description The published payload, byte-for-byte. Always a JSON object. */
             requestBody: {
                 content: {
+                    /**
+                     * @example {
+                     *       "id": "inv_1",
+                     *       "amount": 1200
+                     *     }
+                     */
                     "application/json": {
                         [key: string]: unknown;
                     };
                 };
             };
             responses: {
-                /** @description Delivery succeeded. */
+                /** @description Delivery succeeded. The delivery becomes `succeeded` and no further attempts are made. */
                 "2XX": {
                     headers: {
                         [name: string]: unknown;
                     };
                     content?: never;
                 };
-                /** @description Any other status (including 3xx), a timeout or a connection error is a failed attempt. */
+                /**
+                 * @description Any other status (including `3xx`), no response within the timeout (`timeout`), a DNS failure
+                 *     (`dns_error`) or a connection or TLS failure (`connection_error`) is a failed attempt. Retries with
+                 *     backoff arrive with US-005; until then a failed attempt makes the delivery `failed`.
+                 */
                 default: {
                     headers: {
                         [name: string]: unknown;
@@ -808,7 +835,7 @@ export interface components {
         IdempotencyKey: string;
         /** @description The message ID. Stable across retries and replays. */
         WebhookIDHeader: components["schemas"]["MessageID"];
-        /** @description Unix seconds at send time (fresh for every attempt). */
+        /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
         WebhookTimestampHeader: string;
         /** @description Space-separated list of `v1,<base64 signature>`. */
         WebhookSignatureHeader: string;
@@ -1356,7 +1383,7 @@ export interface operations {
             header: {
                 /** @description The message ID. Stable across retries and replays. */
                 "webhook-id": components["parameters"]["WebhookIDHeader"];
-                /** @description Unix seconds at send time (fresh for every attempt). */
+                /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
                 "webhook-timestamp": components["parameters"]["WebhookTimestampHeader"];
                 /** @description Space-separated list of `v1,<base64 signature>`. */
                 "webhook-signature": components["parameters"]["WebhookSignatureHeader"];
