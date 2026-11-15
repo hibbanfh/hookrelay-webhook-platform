@@ -1,0 +1,24 @@
+# Optional local override for machines where a TLS-inspecting antivirus or corporate proxy
+# (Kaspersky, Zscaler, ...) re-signs HTTPS traffic and image builds fail with
+# SELF_SIGNED_CERT_IN_CHAIN or "x509: certificate signed by unknown authority".
+#
+#   1. Export the inspecting root CA as PEM to .certs/extra-ca.pem (gitignored).
+#   2. cp docker-compose.override.example.yml docker-compose.override.yml (gitignored).
+#   3. make dev. docker compose merges the override automatically.
+#
+# The certificate is a build secret: it is used for npm ci / go mod download only and is never
+# written into an image layer.
+
+x-ca-build: &ca-build
+  secrets: [extra_ca]
+
+services:
+  migrate: { build: *ca-build }
+  seed: { build: *ca-build }
+  api: { build: *ca-build }
+  worker: { build: *ca-build }
+  web: { build: *ca-build }
+
+secrets:
+  extra_ca:
+    file: ./.certs/extra-ca.pem

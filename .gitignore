@@ -3,6 +3,10 @@
 .env.*
 !.env.example
 
+# Machine-local docker compose override and extra CA certs (see docker-compose.override.example.yml)
+docker-compose.override.yml
+.certs/
+
 # Go
 *.exe
 *.test

@@ -6,7 +6,15 @@ FROM golang:1.26-bookworm AS build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Optional extra CA certificates (for example a TLS-inspecting antivirus or corporate proxy), appended
+# to the system bundle. Supplied only by a local docker-compose.override.yml; absent in CI and production.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=secret,id=extra_ca,required=false \
+    if [ -s /run/secrets/extra_ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/extra_ca > /tmp/ca-bundle.crt; \
+      export SSL_CERT_FILE=/tmp/ca-bundle.crt; \
+    fi; \
+    go mod download
 COPY . .
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \

@@ -4,7 +4,12 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
+# Optional extra CA certificates (for example a TLS-inspecting antivirus or corporate proxy).
+# Supplied only by a local docker-compose.override.yml; absent in CI and production.
+RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=secret,id=extra_ca,required=false \
+    if [ -s /run/secrets/extra_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/extra_ca; fi; \
+    npm ci
 
 FROM node:22-alpine AS build
 WORKDIR /app
