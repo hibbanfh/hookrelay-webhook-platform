@@ -102,7 +102,7 @@ func Load(getenv Getenv) (Config, error) {
 		MaxBodyBytes:            int64(r.positiveInt("MAX_BODY_BYTES", 262144)),
 		IdempotencyTTL:          r.duration("IDEMPOTENCY_TTL", "24h"),
 		DeliveryTimeout:         r.duration("DELIVERY_TIMEOUT", "10s"),
-		RetrySchedule:           r.durations("RETRY_SCHEDULE", "5s,30s,2m,15m,1h"),
+		RetrySchedule:           r.retrySchedule("RETRY_SCHEDULE", "5s,30s,2m,15m,1h"),
 		RetryJitter:             r.jitter("RETRY_JITTER", "0.10"),
 		WorkerConcurrency:       r.positiveInt("WORKER_CONCURRENCY", 16),
 		WorkerPollInterval:      r.duration("WORKER_POLL_INTERVAL", "500ms"),
@@ -256,13 +256,21 @@ func (r *reader) duration(name, def string) time.Duration {
 	return d
 }
 
-func (r *reader) durations(name, def string) []time.Duration {
+// maxRetryDelay mirrors entity.MaxRetryDelay (platform must not import a module): it catches typos
+// like 1000h and keeps the jitter multiplication far from time.Duration overflow.
+const maxRetryDelay = 24 * time.Hour
+
+func (r *reader) retrySchedule(name, def string) []time.Duration {
 	parts := splitList(r.str(name, def))
+	if len(parts) == 0 {
+		r.fail(name, "must list at least one positive Go duration")
+		return nil
+	}
 	out := make([]time.Duration, 0, len(parts))
 	for _, p := range parts {
-		d, err := time.ParseDuration(p)
-		if err != nil || d <= 0 {
-			r.fail(name, "invalid duration %q", p)
+		d, err := parseRetryDelay(p)
+		if err != nil {
+			r.fail(name, "%v", err)
 			continue
 		}
 		out = append(out, d)
@@ -270,10 +278,21 @@ func (r *reader) durations(name, def string) []time.Duration {
 	return out
 }
 
+func parseRetryDelay(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid duration %q", s)
+	}
+	if d > maxRetryDelay {
+		return 0, fmt.Errorf("%q exceeds %s", s, maxRetryDelay)
+	}
+	return d, nil
+}
+
 func (r *reader) jitter(name, def string) float64 {
 	v := r.str(name, def)
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || f < 0 || f >= 1 {
+	if err != nil || !(f >= 0 && f < 1) { // written this way so NaN fails
 		r.fail(name, "must satisfy 0 <= j < 1, got %q", v)
 	}
 	return f

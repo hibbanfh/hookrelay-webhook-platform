@@ -63,6 +63,8 @@ func (b *lockedBuffer) String() string {
 // workerConfig is a fast worker: it polls every 50 ms. Tests override single fields.
 func workerConfig(mutate func(*config.Config)) config.Config {
 	cfg := config.Config{
+		// RetrySchedule is empty on purpose: no retries, so the US-004 tests see one final attempt.
+		// Retry tests set it.
 		AppEnv: config.EnvDevelopment, SecretEncryptionKey: bytes.Repeat([]byte{9}, 32),
 		DeliveryTimeout: 5 * time.Second, WorkerConcurrency: 16, WorkerPollInterval: 50 * time.Millisecond,
 		WorkerLeaseDuration: 30 * time.Second, WorkerShutdownTimeout: 5 * time.Second,
@@ -399,9 +401,10 @@ func testDisabledAfterPublish(t *testing.T, a api, pool *pgxpool.Pool) {
 	endpointID := a.createEndpoint(t, tenant.cred, rcv.srv.URL+"/hook")["id"].(string)
 	id, _ := a.publishPayload(t, tenant.cred, `{}`) // no worker is running yet
 	a.setEnabled(t, tenant.cred, endpointID, false)
-	startWorker(t, pool, workerConfig(nil), developmentNetguard())
+	startWorker(t, pool, retryConfig(time.Second, 2*time.Second), developmentNetguard())
 
 	d := waitSettled(t, pool, id)
+	time.Sleep(quietPeriod) // a retry would show up within 1s + jitter
 	attempts := attemptsOf(t, pool, id)
 
 	if d.status != "failed" || len(attempts) != 1 || attempts[0].errText == nil || *attempts[0].errText != "endpoint_disabled" || attempts[0].duration != 0 {
@@ -431,10 +434,13 @@ func testRebindBlocked(t *testing.T, a api, pool *pgxpool.Pool) {
 		t.Fatal(err)
 	}
 	production := netguard.Options{Production: true, Resolver: rebindResolver{to: netip.MustParseAddr("127.0.0.1")}}
-	startWorker(t, pool, workerConfig(func(c *config.Config) { c.AppEnv = config.EnvProduction }), production)
+	cfg := retryConfig(time.Second, 2*time.Second)
+	cfg.AppEnv = config.EnvProduction
+	startWorker(t, pool, cfg, production)
 
 	id, _ := a.publishPayload(t, tenant.cred, `{}`)
 	d := waitSettled(t, pool, id)
+	time.Sleep(quietPeriod) // a retry would show up within 1s + jitter
 	attempts := attemptsOf(t, pool, id)
 
 	if d.status != "failed" || !d.nextIsNull || len(attempts) != 1 || attempts[0].errText == nil || *attempts[0].errText != "destination_blocked" || attempts[0].status != nil {

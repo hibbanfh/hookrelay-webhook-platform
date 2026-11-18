@@ -54,7 +54,7 @@ func workerBinary(t *testing.T) string {
 		binaryPath = filepath.Join(dir, "hookrelay")
 		out, err := exec.Command("go", "build", "-o", binaryPath, ".").CombinedOutput()
 		if err != nil {
-			binaryErr = fmt.Errorf("go build: %v\n%s", err, out)
+			binaryErr = fmt.Errorf("go build: %w\n%s", err, out)
 		}
 	})
 	if binaryErr != nil {
@@ -429,4 +429,104 @@ func TestWorkerSIGTERMDrainDeadline(t *testing.T) {
 	if n := attemptCount(t, pool, id); n != 1 {
 		t.Fatalf("%d attempts after the lease expired, want 1", n)
 	}
+}
+
+func answerServiceUnavailable(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
+type retryRows struct {
+	numbers  []int
+	triggers []string
+	starts   []time.Time
+}
+
+func retryRowsOf(t *testing.T, pool *pgxpool.Pool, messageID string) retryRows {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT a.attempt_number, a.trigger, a.started_at FROM attempts a
+		JOIN deliveries d ON d.id = a.delivery_id WHERE d.message_id = $1 ORDER BY a.attempt_number`, messageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out retryRows
+	for rows.Next() {
+		var n int
+		var trigger string
+		var started time.Time
+		if err := rows.Scan(&n, &trigger, &started); err != nil {
+			t.Fatal(err)
+		}
+		out.numbers, out.triggers, out.starts = append(out.numbers, n), append(out.triggers, trigger), append(out.starts, started)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func nextAttemptOf(t *testing.T, pool *pgxpool.Pool, messageID string) *time.Time {
+	t.Helper()
+	var next *time.Time
+	err := pool.QueryRow(context.Background(), `SELECT next_attempt_at FROM deliveries WHERE message_id = $1`, messageID).Scan(&next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return next
+}
+
+// US-005 AC "all workers restarted before the retry is due": the retry state is the row alone, so
+// a fresh process retries at or after next_attempt_at.
+func TestWorkerRetryIsDurableAcrossRestart(t *testing.T) {
+	pool, dsn := pgtest.Start(t)
+	rcv := newProcessReceiver(t, answerServiceUnavailable)
+	env := workerEnv(dsn, map[string]string{"RETRY_SCHEDULE": "10s", "RETRY_JITTER": "0.10"})
+	w := newWorld(t, pool, env, rcv.srv.URL)
+	a, b := startWorkerProcess(t, env), startWorkerProcess(t, env)
+	id := w.publish(t)
+	waitForAttemptRows(t, pool, id, 1)
+	due := nextAttemptOf(t, pool, id)
+
+	a.signal(t, syscall.SIGKILL)
+	b.signal(t, syscall.SIGKILL)
+	a.waitExit(t, 10*time.Second)
+	b.waitExit(t, 10*time.Second)
+
+	if due == nil || !time.Now().Before(*due) {
+		t.Fatalf("test too slow to prove anything: next_attempt_at %v", due)
+	}
+	if n := attemptCount(t, pool, id); n != 1 {
+		t.Fatalf("%d attempt rows after the kill, want 1", n)
+	}
+	startWorkerProcess(t, env)
+	if cReady := time.Now(); !cReady.Before(*due) {
+		t.Fatalf("test too slow to prove anything: the fresh worker was ready at %v, after the retry was due at %v", cReady, *due)
+	}
+
+	waitForStatus(t, pool, id, "succeeded", 30*time.Second)
+
+	rows := retryRowsOf(t, pool, id)
+	if len(rows.numbers) != 2 || rows.numbers[0] != 1 || rows.numbers[1] != 2 || rows.triggers[0] != "automatic" || rows.triggers[1] != "automatic" {
+		t.Fatalf("attempt rows %+v, want 1 and 2, both automatic", rows)
+	}
+	next := nextAttemptOf(t, pool, id)
+	if rows.starts[1].Before(*due) || next != nil {
+		t.Fatalf("attempt 2 started %v, retry due %v, next_attempt_at %v", rows.starts[1], *due, next)
+	}
+	if seen := rcv.seenIDs(); len(seen) != 2 || seen[0] != id || seen[1] != id {
+		t.Fatalf("the receiver saw %v, want the same webhook-id twice", seen)
+	}
+}
+
+func waitForAttemptRows(t *testing.T, pool *pgxpool.Pool, messageID string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if attemptCount(t, pool, messageID) >= n {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("delivery of %s did not record %d attempts", messageID, n)
 }

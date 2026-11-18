@@ -417,8 +417,11 @@ export interface webhooks {
                 };
                 /**
                  * @description Any other status (including `3xx`), no response within the timeout (`timeout`), a DNS failure
-                 *     (`dns_error`) or a connection or TLS failure (`connection_error`) is a failed attempt. Retries with
-                 *     backoff arrive with US-005; until then a failed attempt makes the delivery `failed`.
+                 *     (`dns_error`) or a connection or TLS failure (`connection_error`) is a failed attempt. A failed
+                 *     automatic attempt is retried, by default (`RETRY_SCHEDULE`, `RETRY_JITTER`), after 5s, 30s, 2m, 15m and 1h
+                 *     (each ±10% jitter, measured from the end of the failed attempt), so at most 6 attempts in total; after the last one the delivery becomes
+                 *     `failed`. Every retry carries the same `webhook-id` and body with a fresh timestamp and signature.
+                 *     Manual replays are not retried. Redirects are never followed.
                  */
                 default: {
                     headers: {
@@ -576,17 +579,26 @@ export interface components {
             };
             deliveries: components["schemas"]["Delivery"][];
         };
-        /** @enum {string} */
+        /**
+         * @description `pending`: waiting for its first attempt or a scheduled retry, or an attempt is in flight.
+         *     `succeeded`: an attempt got a `2xx`; no further attempts are made.
+         *     `failed`: final. Retries are exhausted, the destination is blocked (`destination_blocked`), the endpoint
+         *     is disabled (`endpoint_disabled`), or a manual replay failed. Only a replay starts it again.
+         * @enum {string}
+         */
         DeliveryStatus: "pending" | "succeeded" | "failed";
         Delivery: {
             id: components["schemas"]["DeliveryID"];
             message_id: components["schemas"]["MessageID"];
             endpoint_id: components["schemas"]["EndpointID"];
             status: components["schemas"]["DeliveryStatus"];
+            /** @description Finished attempts so far (automatic and manual). An attempt cut short by a worker crash is not counted. */
             attempt_count: number;
             /**
              * Format: date-time
-             * @description When the next attempt is due (or, while an attempt is in flight, when its lease expires). `null` when not `pending`.
+             * @description When the next attempt is due: the first attempt, or a scheduled retry after a failed automatic
+             *     attempt (backoff with jitter). While an attempt is in flight it is the lease expiry instead.
+             *     `null` when not `pending`.
              */
             next_attempt_at: string | null;
             /** Format: date-time */

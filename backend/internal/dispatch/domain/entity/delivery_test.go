@@ -120,3 +120,43 @@ func TestApplyOutcomeDoesNotChangeTheReceiver(t *testing.T) {
 		t.Fatalf("ApplyOutcome must be pure, delivery is now %+v", d)
 	}
 }
+
+func TestApplyOutcomeWalksTheBackoffSchedule(t *testing.T) {
+	schedule := mustSchedule(t, []time.Duration{time.Second, 2 * time.Second}, 0.10, 0.5)
+	fail := resultOf(entity.HTTPOutcome(500, nil))
+
+	first, _ := claimed(entity.TriggerAutomatic, 0).ApplyOutcome(fail, schedule, t0)
+	second, _ := claimed(entity.TriggerAutomatic, 1).ApplyOutcome(fail, schedule, t0)
+	third, _ := claimed(entity.TriggerAutomatic, 2).ApplyOutcome(fail, schedule, t0)
+
+	at1, at2 := t0.Add(time.Second), t0.Add(2*time.Second)
+	if first.Status != entity.StatusPending || !sameTime(first.NextAttemptAt, &at1) || first.AttemptCount != 1 {
+		t.Fatalf("after attempt 1: %+v", first)
+	}
+	if second.Status != entity.StatusPending || !sameTime(second.NextAttemptAt, &at2) || second.AttemptCount != 2 {
+		t.Fatalf("after attempt 2: %+v", second)
+	}
+	if third.Status != entity.StatusFailed || third.NextAttemptAt != nil || third.AttemptCount != 3 {
+		t.Fatalf("after attempt 3: %+v", third)
+	}
+}
+
+func TestApplyOutcomeWithTheBackoffScheduleManualFailsAtOnce(t *testing.T) {
+	schedule := mustSchedule(t, []time.Duration{time.Second, 2 * time.Second}, 0.10, 0.5)
+
+	next, _ := claimed(entity.TriggerManual, 0).ApplyOutcome(resultOf(entity.HTTPOutcome(500, nil)), schedule, t0)
+
+	if next.Status != entity.StatusFailed || next.NextAttemptAt != nil {
+		t.Fatalf("manual failure must be final: %+v", next)
+	}
+}
+
+func TestApplyOutcomeSuccessOnARetryClearsTheSchedule(t *testing.T) {
+	schedule := mustSchedule(t, []time.Duration{time.Second, 2 * time.Second}, 0.10, 0.5)
+
+	next, _ := claimed(entity.TriggerAutomatic, 1).ApplyOutcome(resultOf(entity.HTTPOutcome(200, nil)), schedule, t0)
+
+	if next.Status != entity.StatusSucceeded || next.NextAttemptAt != nil || next.AttemptCount != 2 {
+		t.Fatalf("success on attempt 2: %+v", next)
+	}
+}
