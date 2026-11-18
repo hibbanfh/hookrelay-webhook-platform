@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"fmt"
+
 	"github.com/google/wire"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -15,6 +17,7 @@ import (
 	"hookrelay/internal/library/ids"
 	"hookrelay/internal/library/netguard"
 	"hookrelay/internal/library/postgres"
+	"hookrelay/internal/library/random"
 	"hookrelay/internal/platform/config"
 )
 
@@ -23,7 +26,7 @@ import (
 // netguard options and the build version from the injector. The API graph never includes it
 // (ADR 0002): a request path must not be able to make an outbound call.
 var DispatchSet = wire.NewSet(
-	ProvideDispatchClock, ProvideQueueClock, ProvideDispatchIDs, ProvideDispatchTx,
+	ProvideDispatchClock, ProvideQueueClock, ProvideDispatchIDs, ProvideDispatchTx, ProvideDispatchJitter,
 
 	ProvideDeliverySource, ProvideAttemptSource,
 	wire.Bind(new(dispatchsource.DeliveryPersistent), new(*dispatchsource.DeliveryPersistentImpl)),
@@ -31,7 +34,6 @@ var DispatchSet = wire.NewSet(
 	repositoryimpl.NewDeliveryQueue,
 	repositoryimpl.NewAttemptRepository,
 
-	// US-005 replaces this one provider with the backoff schedule.
 	ProvideRetryPlanner,
 
 	netguard.ProviderSet, UserAgent, ProvideSender,
@@ -60,8 +62,14 @@ func ProvideAttemptSource(pool *pgxpool.Pool) *dispatchsource.AttemptPersistentI
 	return dispatchsource.NewAttemptPersistent(pool)
 }
 
-// ProvideRetryPlanner returns the no-retry planner: until US-005 a failed attempt is final.
-func ProvideRetryPlanner() dispatchentity.RetryPlanner { return dispatchentity.NoRetry{} }
+// ProvideRetryPlanner builds the backoff schedule from RETRY_SCHEDULE and RETRY_JITTER.
+func ProvideRetryPlanner(cfg config.Config, src dispatchentity.JitterSource) (dispatchentity.RetryPlanner, error) {
+	schedule, err := dispatchentity.NewBackoffSchedule(cfg.RetrySchedule, cfg.RetryJitter, src)
+	if err != nil {
+		return nil, fmt.Errorf("build retry schedule: %w", err)
+	}
+	return schedule, nil
+}
 
 // ProvideSender builds the outbound sender with two clients: the guarded one for ordinary
 // destinations (SSRF checks at dial time in production) and the allowlisted one for the demo
@@ -105,3 +113,6 @@ func ProvideDispatchIDs(g *ids.Generator) dispatchuc.IDGenerator { return g }
 
 // ProvideDispatchTx binds the transaction manager to the dispatch TxManager port.
 func ProvideDispatchTx(m *postgres.TxManager) dispatchuc.TxManager { return m }
+
+// ProvideDispatchJitter binds the uniform random source to the dispatch JitterSource port.
+func ProvideDispatchJitter(u random.Uniform) dispatchentity.JitterSource { return u }

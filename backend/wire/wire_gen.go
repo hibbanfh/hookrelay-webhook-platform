@@ -352,7 +352,13 @@ func InitializeWorker(ctx context.Context, cfg config.Config, version BuildVersi
 	}
 	userAgent := UserAgent(version)
 	sender := ProvideSender(policy, cfg, userAgent)
-	retryPlanner := ProvideRetryPlanner()
+	uniform := random.NewUniform()
+	jitterSource := ProvideDispatchJitter(uniform)
+	retryPlanner, err := ProvideRetryPlanner(cfg, jitterSource)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
 	txManager := postgres.NewTxManager(pool)
 	usecaseTxManager := ProvideDispatchTx(txManager)
 	attemptDeliveryDeps := usecase4.AttemptDeliveryDeps{
@@ -427,7 +433,12 @@ func InitializeRunner(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, n
 	}
 	userAgent := UserAgent(version)
 	sender := ProvideSender(policy, cfg, userAgent)
-	retryPlanner := ProvideRetryPlanner()
+	uniform := random.NewUniform()
+	jitterSource := ProvideDispatchJitter(uniform)
+	retryPlanner, err := ProvideRetryPlanner(cfg, jitterSource)
+	if err != nil {
+		return nil, err
+	}
 	txManager := postgres.NewTxManager(pool)
 	usecaseTxManager := ProvideDispatchTx(txManager)
 	attemptDeliveryDeps := usecase4.AttemptDeliveryDeps{

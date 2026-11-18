@@ -226,3 +226,44 @@ func TestACompletedRowCannotBeCompletedAgainWithTheSameToken(t *testing.T) {
 		t.Fatalf("got %v, want ErrLeaseLost", err)
 	}
 }
+
+// A retry lives only in the row: another pool, as a fresh process would see it, must not claim
+// the rescheduled delivery before next_attempt_at and must claim it from then on.
+func TestARescheduledDeliveryIsClaimedOnlyOnceDue(t *testing.T) {
+	h := start(t)
+	ctx := context.Background()
+	due := t0
+	h.seedOne(t, "dlv_1", projectA, "ep_A", "pending", &due)
+	claimed, err := h.queue.ClaimDue(ctx, t0, 5, leaseAt("lse_A", t0))
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("first claim: %v, err %v", claimedIDs(claimed), err)
+	}
+	retryAt := t0.Add(5 * time.Second)
+	rescheduled := claimed[0]
+	rescheduled.AttemptCount = 1
+	rescheduled.NextAttemptAt = &retryAt
+	rescheduled.LastAttemptAt = &due
+	rescheduled.Lease = entity.Lease{}
+	if err := h.queue.Complete(ctx, rescheduled, "lse_A"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := postgres.Open(ctx, h.dsn, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(second.Close)
+	otherPool := newQueueOn(second)
+
+	early, errEarly := otherPool.ClaimDue(ctx, retryAt.Add(-time.Millisecond), 5, leaseAt("lse_B", retryAt))
+	onTime, errOnTime := otherPool.ClaimDue(ctx, retryAt, 5, leaseAt("lse_C", retryAt))
+
+	if errEarly != nil || len(early) != 0 {
+		t.Fatalf("claim 1 ms before the retry: %v, err %v, want nothing", claimedIDs(early), errEarly)
+	}
+	if errOnTime != nil {
+		t.Fatalf("claim at the retry time: %v", errOnTime)
+	}
+	if len(onTime) != 1 || onTime[0].AttemptCount != 1 || onTime[0].Trigger != entity.TriggerAutomatic {
+		t.Fatalf("at the retry time: %+v", onTime)
+	}
+}

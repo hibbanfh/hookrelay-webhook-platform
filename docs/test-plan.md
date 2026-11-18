@@ -195,6 +195,41 @@ Observations, no bug filed: a production worker needs `NEON_AUTH_BASE_URL` and `
 
 Verdict: all 11 criteria PASS. No new bugs. The story is not marked done (caller decides).
 
+## US-005 (retry failed deliveries with exponential backoff)
+
+QA verification, 2026-11-18. Changes were uncommitted. Legend as US-004 plus CFG = `platform/config/retry_test.go`, QA = tests added by QA.
+
+Method: an LF-stripped copy of `backend/` run in `golang:1.26-bookworm` with `REQUIRE_DOCKER=1`, Docker socket mounted, `TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal`, `TESTCONTAINERS_RYUK_DISABLED=true` (needed for Windows Docker Desktop). Live black-box run: real binary built in the container, `postgres:16-alpine`, `hookrelay migrate up`, `seed`, `api` and `worker` as separate processes, a Go receiver (`/tmp/recv`: `/flaky` = 500 twice per webhook-id then 200, `/always500`, `/four04`), `RETRY_SCHEDULE=1s,2s`, rows read with `psql`.
+
+| # | Criterion | Verdict | Automated evidence | Live evidence |
+|---|---|---|---|---|
+| 1 | Default 5s,30s,2m,15m,1h, +-10%, 6 attempts | PASS | CFG `defaults` (exact slice, jitter 0.10); ENT default table and bounds (u=0, u->1), `Next(6)` reports no retry (`TestBackoffScheduleExhaustedOrOutOfRange`); LIB samples in [0,1); QA `TestDefaultScheduleStaysWithinTenPercentJitter` (default `config.Load` -> Wire `ProvideRetryPlanner` -> real `random.Uniform`, 20000 samples per delay: all within +-10%, spread reaches both ends, 6th failure not retried) | not run with the real 5s..1h (too long); the ENT/QA tests cover it |
+| 2 | Failure with attempts left -> `pending`, `attempt_count`, `next_attempt_at` = delay +- jitter (non-2xx, timeout, refused, DNS) | PASS | UC table (500, 404, 302, timeout, connection_error, dns_error); E2E `TestDispatchRetries/a_failed_attempt_leaves_a_retry_pending` (500, timeout, refused, window check); QA `TestDispatchRetriesQA/a_DNS_failure_leaves_a_retry_pending` (real resolver, `.invalid` host, attempt error `dns_error`, `pending`, `attempt_count 1`, next within [27s, d+34s] of start) | every failure kind retried to attempt 3: `500`, `404`, `connection_error`, `dns_error` rows in `attempts` |
+| 3 | `[1s,2s]`, fail twice then 200 -> `succeeded` after exactly 3, gaps >= 0.9s / 1.8s | PASS | ENT walk; UC walk; E2E `two_failures_then_success_is_three_attempts` (3 rows, gaps >= 900 ms and >= 1800 ms, 3 hits after a 3 s quiet period) | `/flaky`: 500, 500, 200, `succeeded`, `attempt_count 3`, `next_attempt_at` NULL; gaps 1.188 s and 1.935 s |
+| 4 | `[1s,2s]`, always 500 -> `failed` after exactly 3, `next_attempt_at` null, no more attempts | PASS | ENT, UC exhaustion; E2E `an_always_failing_receiver_gets_exactly_three_attempts` (3 rows, 3 hits after 3 s); QA 20 deliveries over two runners: each exactly 3 attempt rows and 3 receiver hits, no duplicate | `/always500`: `failed`, 3 attempts, next NULL, gaps 1.073 s and 2.050 s; 15 attempt rows 5 s later, receiver log unchanged (no 4th attempt) |
+| 5 | Retry durable across restart of all workers | PASS | INT `TestARescheduledDeliveryIsClaimedOnlyOnceDue` (second pool); PROC `TestWorkerRetryIsDurableAcrossRestart` (two workers SIGKILLed, a fresh one retries at or after `next_attempt_at`, same `webhook-id`); E2E `a_retry_survives_a_restart_of_the_worker` | two workers started, delivery `pending` with `next_attempt_at 15:48:12.126`; `kill -9` all workers at 15:48:04; new worker at 15:48:11; attempt 2 started 15:48:12.156 (after due), attempt 3 at 15:48:24.386, `succeeded` |
+| 6 | `destination_blocked` -> no retry | PASS | ENT/UC planner not consulted (UC table: `destination_blocked` -> `failed`); E2E `production_blocks_a_name_that_now_resolves_to_a_private_address` now runs with `[1s,2s]` plus a 3 s quiet period; same for `endpoint_disabled` | not run live (needs a production worker and a rebinding host; the US-004 live check covers the block itself) |
+| 7 | Success on a retry -> no more attempts | PASS | ENT 200 on attempt 2 -> `succeeded`, next nil; E2E success test waits 3 s after `succeeded`: still 3 rows, 3 hits | `/flaky` stayed at 3 attempts, 3 receiver lines |
+
+Edge cases probed:
+
+| Probe | Result | Evidence |
+|---|---|---|
+| Invalid `RETRY_SCHEDULE` / `RETRY_JITTER` stop the worker at startup | PASS | QA `TestWorkerRefusesToStartWithInvalidRetrySettings` (real binary, 9 cases: `abc`, `,`, `5s,0s`, `-5s`, `48h`, jitter `1`, `-0.5`, `NaN`, `lots`; each exits non-zero within 15 s and prints the variable name). Live: `hookrelay: invalid configuration: RETRY_SCHEDULE: invalid duration "abc"` exit 1; `RETRY_JITTER: must satisfy 0 <= j < 1, got "1.5"` exit 1; `RETRY_SCHEDULE=" , "` -> `must list at least one positive Go duration` exit 1 |
+| Manual-trigger delivery is not retried | PASS (unit only) | ENT `TestApplyOutcomeWithTheBackoffScheduleManualFailsAtOnce`. No manual path exists before US-007, so there is no end-to-end test yet |
+| 4xx and 3xx are retried | PASS | UC table (404, 302); QA E2E `4xx_and_3xx_responses_are_retried` (404, 302, 200 -> `succeeded` after 3); live `/four04`: 3 attempts, then `failed` |
+| Two runners on one burst | PASS | QA `two_runners_give_every_delivery_exactly_three_attempts` (20 messages, always 500) |
+| Wire graph | PASS | `go tool wire gen ./wire` on the copy reproduces the committed `wire_gen.go` (identical apart from CR) |
+| Empty `RetrySchedule` in a hand-built `config.Config` means no retry | PASS | the US-004 E2E tests (timeout, redirect) still pass with `workerConfig` |
+
+Gates (copy of `backend/`, container): `go vet -tags integration ./...` clean; `sh scripts/check-layers.sh` "layer rules: OK"; `gofmt -l .` empty on the LF copy; `go test -race -count=1 -tags integration ./...` every package ok, exit 0 (`cmd/server` 49 s, `wire` 202 s, `internal/dispatch/data/repository` 49 s, `migrations` 60 s). The `cmd/server` PROC tests included the new durability and config tests.
+
+Tests added (QA): `backend/wire/dispatch_retry_qa_integration_test.go` (DNS failure, 4xx/3xx, two-runner burst), `backend/wire/retry_default_qa_test.go` (default schedule jitter bounds through the real wiring), `backend/cmd/server/worker_retry_config_qa_integration_test.go` (invalid settings, real binary, Linux only).
+
+Not tested: the real default delays (5s..1h, only sampled), a manual replay end to end (US-007), `Retry-After` (US-020), a production-mode live rebind, Windows process tests (`syscall.Kill`), long-term config change with deliveries already pending. Timing assertions are lower bounds only (a loaded CI runner cannot make them flaky); the only upper bounds are the `next_attempt_at` window (d+34s for a 30s delay) and the 20 s settle deadlines.
+
+Verdict: all 7 criteria PASS. No new bugs. The story is not marked done (caller decides).
+
 ## Bugs
 
 BUG-QA-001..014, see `docs/backlog.md` (section "Bugs (QA)").

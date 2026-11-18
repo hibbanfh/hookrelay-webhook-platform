@@ -9,7 +9,7 @@ type RetryPlanner interface {
 	Next(attemptNumber int, now time.Time) (time.Time, bool)
 }
 
-// NoRetry never retries: a failed attempt is final. US-005 replaces it with a backoff schedule.
+// NoRetry never retries: a failed attempt is final. Used by tests; production wires BackoffSchedule.
 type NoRetry struct{}
 
 // Next always reports that there is no retry.

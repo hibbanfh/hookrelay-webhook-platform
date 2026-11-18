@@ -5,6 +5,10 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 ### Added
+- US-005: retry failed deliveries with jittered exponential backoff.
+  - A failed automatic attempt (any non-2xx including 3xx/4xx, `timeout`, `dns_error`, `connection_error`) stays `pending` with `next_attempt_at` = end of the attempt + delay × (1 ± jitter). Default `RETRY_SCHEDULE=5s,30s,2m,15m,1h`, `RETRY_JITTER=0.10`: 6 attempts, about 1h18m. Exhausted → `failed` with `next_attempt_at = null`. `destination_blocked`, `endpoint_disabled` and manual-trigger attempts are never retried.
+  - Retry state lives only in the delivery row, so a retry survives a restart of every worker (verified by SIGKILLing two worker processes before the retry was due). No migration and no SQL change: `entity.BackoffSchedule` replaces `NoRetry` behind the existing `RetryPlanner` port, with jitter from an injected `entity.JitterSource` (`library/random.Uniform`, `math/rand/v2`).
+  - Startup validation: `RETRY_SCHEDULE` needs at least one Go duration, each `> 0` and `<= 24h`; `RETRY_JITTER` must satisfy `0 <= j < 1` (NaN rejected). Invalid values exit 1 with the variable named.
 - US-004: deliver messages asynchronously with signed payloads (ADR 0014).
   - `hookrelay worker` claims due deliveries with `FOR UPDATE SKIP LOCKED` (only as many as it has free slots, one lease per batch), signs each request in the Standard Webhooks format (`webhook-id` = message ID, `webhook-timestamp`, `webhook-signature` = `v1,` + base64 HMAC-SHA256 over `{id}.{ts}.{body}`) and posts the stored payload bytes unchanged. Verified against the reference library (`github.com/standard-webhooks/standard-webhooks/libraries/go`, test-only) and its published test vector.
   - Attempts are recorded once, at completion, in one transaction with a fenced update of the delivery (a worker that lost its lease writes nothing). Migration 0005 adds `attempts`. 2xx is `succeeded`; any other result is `failed` (retries arrive with US-005), with status, duration and the first 4 KB of the response, or `timeout` / `dns_error` / `connection_error`. Redirects are not followed.

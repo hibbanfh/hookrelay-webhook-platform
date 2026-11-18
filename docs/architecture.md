@@ -329,7 +329,8 @@ fenced completion, catalog adapters, shutdown).
 | Value | `Status` (`pending`/`succeeded`/`failed`), `Trigger` (`automatic`/`manual`), `AttemptError` (`timeout`, `connection_error`, `dns_error`, `destination_blocked`, `endpoint_disabled`; the last two are terminal), `Lease{Token, ExpiresAt}` | typed constants |
 | Value | `Outcome{StatusCode, Body, Err}`, `ResponseBody{Text, Truncated}` | `NewResponseBody` keeps at most 4096 bytes of valid UTF-8 without NUL |
 | Value | `Target{EndpointID, ProjectID, URL, Enabled, Key SigningKey}`, `Job{Delivery, Target, Payload}`, `SignedRequest` | `SigningKey` redacts itself like `endpoint.SigningSecret` |
-| Strategy | `RetryPlanner{Next(attemptNumber, now) (time.Time, bool)}` | `NoRetry` in US-004. US-005 adds the jittered backoff schedule (§8.3) and changes only wiring |
+| Strategy | `RetryPlanner{Next(attemptNumber, now) (time.Time, bool)}` | `BackoffSchedule` (US-005, §8.3) in production; `NoRetry` in tests |
+| Port (entity) | `JitterSource{Float64() float64}` | uniform sample in [0, 1) for `BackoffSchedule`. Declared in `entity`, not `usecase`, because its consumer is an entity; `library/random.Uniform` satisfies it (US-005) |
 | Func | `Sign(key []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
 | Errors | `ErrLeaseLost`, `ErrSendAborted` (US-004); `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrConflict` (US-006/007) | |
 | Port | `DeliveryQueue{ClaimDue(ctx, now, limit, lease), Complete(ctx, delivery, leaseToken)}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that. US-007 adds `RequeueForReplay` |
@@ -337,7 +338,7 @@ fenced completion, catalog adapters, shutdown).
 | Port (outbound) | `Sender{Send(ctx, SignedRequest) (Outcome, error)}` | `data/webhookhttp`: netguard-guarded client. Network failures are outcomes; the only error is `ErrSendAborted` |
 | Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids)}` | → `endpoint.GetDeliveryTargets` (adapter). US-006 adds `GetState` |
 | Port (cross-domain) | `MessageCatalog{GetPayloads(ctx, ids)}` | → `message.GetMessagePayloads` (adapter) |
-| Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` (US-004); `Jitter` (US-005) | |
+| Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` (US-004) | |
 | Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `{Jobs, Skipped}` (3 queries per batch) |
 | Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → tx{fenced `Complete`, `Attempts.Create`} |
 | Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` (US-007) |
@@ -669,7 +670,7 @@ sequenceDiagram
             S->>X: POST signed request
             X-->>S: status / body (first 4 KB read)
             S-->>AD: Outcome (status | timeout | dns_error | connection_error | destination_blocked)
-            AD->>AD: Delivery.ApplyOutcome(policy, jitter, now) → next state + Attempt
+            AD->>AD: Delivery.ApplyOutcome(result, retryPlanner, now) → next state + Attempt
             AD->>DB: tx{ UPDATE delivery WHERE lease_token = $t; INSERT attempt }
         end
     end
@@ -773,8 +774,17 @@ stateDiagram-v2
 
 Default `RETRY_SCHEDULE=5s,30s,2m,15m,1h`, `RETRY_JITTER=0.10`, so 6 attempts and about 1h18m
 in total. Both are configurable, and the test configuration `[1s,2s]` gives exactly 3 attempts
-with gaps ≥ 0.9 s and ≥ 1.8 s. Jitter comes from the injected `Jitter` port, so tests are
-deterministic. Retry state lives only in the row (`next_attempt_at`), so retries survive restarts.
+with gaps ≥ 0.9 s and ≥ 1.8 s. Retry state lives only in the row (`next_attempt_at`), so retries survive restarts.
+
+- **Numbering:** `n` is the number of the attempt that just failed (1-based, `attempt_count` after it). The delay is
+  `Delays[n-1]`; `n > len(Delays)` means exhausted. A crashed attempt is not counted (ADR 0014).
+- **Reference point:** `now` is the worker clock *after* the failed attempt finished, so the start-to-start gap is
+  `duration + delay × (1 ± j)` + at most one poll interval, never less than `delay × (1 − j)`.
+- **Jitter:** `factor = 1 + j × (2u − 1)` with `u` from the `entity.JitterSource` port (uniform in [0, 1)), so the
+  spread is symmetric ±j. `library/random.Uniform` (`math/rand/v2`) implements it; tests inject a fixed `u`.
+  Jitter is not a security value, so `crypto/rand` is not needed.
+- **Implementation:** `entity.BackoffSchedule` (US-005, [`docs/plans/us-005.md`](plans/us-005.md)). An empty schedule means "never retry";
+  `config.Load` forbids it in real processes.
 
 ### 8.4 Replay (US-007)
 
@@ -927,8 +937,8 @@ clear message. All values come from the environment, and `.env.example` mirrors 
 | `MAX_BODY_BYTES` | `262144` | |
 | `IDEMPOTENCY_TTL` | `24h` | |
 | `DELIVERY_TIMEOUT` | `10s` | per attempt |
-| `RETRY_SCHEDULE` | `5s,30s,2m,15m,1h` | comma-separated Go durations; max attempts = n+1 |
-| `RETRY_JITTER` | `0.10` | 0 ≤ j < 1 |
+| `RETRY_SCHEDULE` | `5s,30s,2m,15m,1h` | comma-separated Go durations; max attempts = n+1. At least one entry, each > 0 and ≤ 24h |
+| `RETRY_JITTER` | `0.10` | 0 ≤ j < 1 (NaN rejected) |
 | `WORKER_CONCURRENCY` | `16` | |
 | `WORKER_POLL_INTERVAL` | `500ms` | |
 | `WORKER_LEASE_DURATION` | `30s` | must be > `DELIVERY_TIMEOUT` + 5 s (validated) |
@@ -1043,10 +1053,10 @@ Decisions: ADR 0014. Use cases: `dispatch.ClaimDueDeliveries`, `dispatch.Attempt
 Adapters: `wire/adapters.go` (`endpointCatalog`, `messageCatalog`). Migration `0005_attempts`.
 
 ### US-005: Retries
-1. `dispatch/domain/entity/backoff_schedule.go` (`BackoffSchedule` implements `RetryPlanner`: `Delays`, jitter via the `Jitter` port). `ApplyOutcome` already has the full §8.3 table from US-004.
-2. `dispatch/domain/usecase/jitter.go`: `Jitter`. `wire/dispatch.go` replaces `ProvideRetryPlanner` (`NoRetry`) with the schedule. Tests: `[1s,2s]` → 3 attempts, gaps, exhausted → `failed` with `next_attempt_at = null`, success on retry stops further attempts, blocked → no retry.
-3. `platform/config`: parse `RETRY_SCHEDULE`, `RETRY_JITTER`. `platform/random`: jitter source.
-4. No migration. Integration test: restart the runner before the retry is due, and the retry still fires at or after `next_attempt_at`.
+Full layer-ordered plan, verification of `ApplyOutcome` against §8.3, config rules and AC → test map:
+[`docs/plans/us-005.md`](plans/us-005.md). No new ADR (§8.3 and ADR 0014 already decide it). New: `entity.BackoffSchedule`
+(implements `RetryPlanner`), port `entity.JitterSource` implemented by `library/random.Uniform`; `wire/dispatch.go`
+swaps `NoRetry` for the schedule. No new use case, no migration, no new endpoint.
 
 ### US-006: Inspect
 1. `dispatch/domain/repository.go`: `Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}`. `ports.go`: `EndpointCatalog.GetState`.
@@ -1131,3 +1141,7 @@ Adapters: `wire/adapters.go` (`endpointCatalog`, `messageCatalog`). Migration `0
     echoes secrets would expose them to the project's users. The webhook docs warn about it. Accept?
 18. **Q18 (US-004): The `User-Agent` names the repository URL.** `https://github.com/hookrelay/hookrelay` is a
     placeholder until the real public repo URL is known.
+19. **Q19 (US-005): Each `RETRY_SCHEDULE` entry is capped at 24h** (guards against typos like `1000h` and float overflow
+    in the jitter multiply). The default schedule is far below it. Confirm, or name a different cap.
+20. **Q20 (US-005): Every non-2xx is retried, including `400`/`401`/`404`** (backlog note), so a misconfigured receiver
+    gets 6 identical requests over about 1h18m. Accept until US-020 (`Retry-After`, `410 Gone`)?

@@ -318,7 +318,9 @@ Notes / out of scope:
 
 ---
 
-### US-005: Retry failed deliveries with exponential backoff            [status: todo]  [priority: P0]
+### US-005: Retry failed deliveries with exponential backoff            [status: done]  [priority: P0]
+
+> **Done 2026-11-18.** All 7 criteria PASS. Evidence: entity, config, use-case and Wire unit tests; Testcontainers integration (`TestARescheduledDeliveryIsClaimedOnlyOnceDue`, `TestDispatchRetries`, `TestDispatchRetriesQA` covering 500/timeout/refused/DNS/4xx/3xx and a 20-delivery two-runner burst with exactly 3 attempts each); process tests on the real binary (`TestWorkerRetryIsDurableAcrossRestart`: two workers SIGKILLed, a fresh worker ready before `next_attempt_at` retries at or after it; invalid `RETRY_*` values exit non-zero). `go test -race -count=1 -tags integration ./...` in a Linux container: 33 packages ok. Live run on the real `api` + `worker` binaries with `RETRY_SCHEDULE=1s,2s`: fail, fail, 200 with gaps 1.188 s / 1.935 s; always-500, 404, refused and DNS each ended `failed` after 3 attempts. Default jitter checked with 20,000 samples per delay through the real wiring. No bugs filed. Review approved after one fix round (24h delay cap enforced in the entity, process-test timing assertion, `rows.Err()` checks). No ADR (design already in architecture §8.3 and ADR 0014); plan in `docs/plans/us-005.md`. Open: architecture §18 Q19 (24h per-delay cap) and Q20 (4xx retried until US-020) taken with the architect's defaults.
 As a platform developer, I want failed deliveries retried automatically with growing
 delays, so that short receiver outages don't lose events and a struggling receiver doesn't get hammered.
 
