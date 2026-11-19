@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -130,6 +131,9 @@ func (u *PublishMessage) reserveOrReplay(ctx context.Context, req publishRequest
 
 func (u *PublishMessage) replay(ctx context.Context, wanted entity.IdempotencyRecord) (*PublishMessageOutput, error) {
 	existing, err := u.deps.Keys.Find(ctx, wanted.ProjectID, wanted.Key)
+	if errors.Is(err, domainerrors.ErrNotFound) {
+		return nil, brokenRecord("key has no reservation", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("find key: %w", err)
 	}
@@ -137,6 +141,9 @@ func (u *PublishMessage) replay(ctx context.Context, wanted entity.IdempotencyRe
 		return nil, domainerrors.ErrIdempotencyMismatch
 	}
 	m, err := u.deps.Messages.Get(ctx, wanted.ProjectID, existing.MessageID)
+	if errors.Is(err, domainerrors.ErrNotFound) {
+		return nil, brokenRecord("message "+existing.MessageID+" is gone", err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("get message %s: %w", existing.MessageID, err)
 	}
@@ -162,4 +169,10 @@ func (u *PublishMessage) fanOut(ctx context.Context, msg entity.Message) error {
 		return fmt.Errorf("enqueue %d deliveries: %w", len(deliveries), err)
 	}
 	return nil
+}
+
+// brokenRecord reports a replay whose key or message is missing. The not-found cause is kept as
+// text only: wrapping it would let the HTTP layer answer 404 for what is a server fault.
+func brokenRecord(what string, cause error) error {
+	return fmt.Errorf("%w: %s: %s", domainerrors.ErrBrokenIdempotencyRecord, what, cause.Error())
 }

@@ -8,6 +8,13 @@ import (
 	"hookrelay/internal/message/domain/entity"
 )
 
+// ListQuery selects one newest-first page of a project's messages. After nil means the first page.
+type ListQuery struct {
+	ProjectID string
+	Limit     int
+	After     *entity.PageAnchor
+}
+
 // MessageRepository stores published messages.
 type MessageRepository interface {
 	// Create stores the message with its payload bytes unchanged.
@@ -17,4 +24,6 @@ type MessageRepository interface {
 	// GetMany returns the messages that exist among ids, in any order. It is a system-level read
 	// with no project scope, for the delivery worker; unknown IDs are absent from the result.
 	GetMany(ctx context.Context, ids []string) ([]entity.Message, error)
+	// List returns up to q.Limit messages without their payloads, newest first.
+	List(ctx context.Context, q ListQuery) ([]entity.MessageHeader, error)
 }

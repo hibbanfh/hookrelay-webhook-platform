@@ -181,9 +181,9 @@ func testPublishCredentials(t *testing.T, a api, pool *pgxpool.Pool) {
 			t.Fatalf("got %d %s, deliveries %v, want only %s", rec.Code, rec.Body, got, mine)
 		}
 	})
-	t.Run("GET is not allowed until the list exists", func(t *testing.T) {
-		rec := a.call(http.MethodGet, "/v1/messages", bearer("anything"), "")
-		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
+	t.Run("DELETE is not allowed on the collection", func(t *testing.T) {
+		rec := a.call(http.MethodDelete, "/v1/messages", bearer("anything"), "")
+		if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, HEAD, POST" {
 			t.Fatalf("got %d Allow=%q", rec.Code, rec.Header().Get("Allow"))
 		}
 	})

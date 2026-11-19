@@ -168,6 +168,8 @@ func TestListEndpointsRejectsBadPagingBeforeTheUseCase(t *testing.T) {
 		{name: "limit zero", query: "?limit=0", want: failure{400, "validation_error", "limit", 0}},
 		{name: "limit not a number", query: "?limit=x", want: failure{400, "validation_error", "limit", 0}},
 		{name: "malformed cursor", query: "?cursor=!!!", want: failure{400, "validation_error", "cursor", 0}},
+		{name: "repeated limit", query: "?limit=1&limit=2", want: failure{400, "validation_error", "limit", 0}},
+		{name: "repeated cursor", query: "?cursor=a&cursor=b", want: failure{400, "validation_error", "cursor", 0}},
 		{name: "cursor with a foreign id shape", query: "?cursor=" + httpx.EncodeCursor(created, "not-an-endpoint-id"), want: failure{400, "validation_error", "cursor", 0}},
 	}
 	for _, tt := range tests {

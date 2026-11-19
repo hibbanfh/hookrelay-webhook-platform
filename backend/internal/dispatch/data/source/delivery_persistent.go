@@ -29,7 +29,7 @@ UPDATE deliveries d
 SET next_attempt_at = $3, lease_token = $4, updated_at = $1
 FROM due
 WHERE d.id = due.id
-RETURNING d.id, d.project_id, d.message_id, d.endpoint_id, d.trigger, d.attempt_count`
+RETURNING d.id, d.project_id, d.message_id, d.endpoint_id, d.trigger, d.attempt_count, d.created_at`
 
 // completeFencedSQL stores the state after an attempt only while this worker still holds the
 // lease. Zero rows means the lease expired and another worker took the row over.
@@ -84,6 +84,6 @@ func (s *DeliveryPersistentImpl) CompleteFenced(ctx context.Context, u model.Del
 
 func scanClaimed(row pgx.CollectableRow) (model.ClaimedDelivery, error) {
 	var m model.ClaimedDelivery
-	err := row.Scan(&m.ID, &m.ProjectID, &m.MessageID, &m.EndpointID, &m.Trigger, &m.AttemptCount)
+	err := row.Scan(&m.ID, &m.ProjectID, &m.MessageID, &m.EndpointID, &m.Trigger, &m.AttemptCount, &m.CreatedAt)
 	return m, err
 }

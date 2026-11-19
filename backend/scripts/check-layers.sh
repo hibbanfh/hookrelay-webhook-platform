@@ -167,10 +167,21 @@ only "dispatch: data/webhookhttp imports domain/{entity,errors} and library/netg
 only "dispatch: delivery/worker imports domain/{usecase,entity,errors} and x/sync only (never data)" 	"$MOD/dispatch/domain/(usecase|entity|errors)|golang.org/x/sync" 	internal/dispatch/delivery/worker
 
 # 5f. the API process must not be able to make an outbound call (ADR 0002): its injectors never
-# mention the sender, the worker or the dispatch module.
-out=$(awk '/^func Initialize(API|Router)\(/,/^}/' wire/wire_gen.go | grep -nE 'webhookhttp|ProvideSender|Dispatch|dispatch|worker\.|Heartbeat')
+# mention the sender or the worker, and may use only the read side of dispatch (DispatchReadSet,
+# US-006). The second check is an allowlist: any other identifier that names delivery, attempt,
+# queue, catalog, sender, claim, retry, lease, runner or worker machinery fails, so a worker-only
+# provider cannot slip into the API graph.
+api_graph=$(awk '/^func Initialize(API|Router)\(/,/^}/' wire/wire_gen.go)
+out=$(echo "$api_graph" | grep -nE 'webhookhttp|ProvideSender|worker\.|Heartbeat')
 if [ -n "$out" ]; then
 	echo "LAYER VIOLATION: the API graph in wire/wire_gen.go references the delivery worker (ADR 0002)"
+	echo "$out"
+	fail=1
+fi
+DISPATCH_READ_SIDE='ProvideDeliveryReadSource|ProvideAttemptSource|NewDeliveryReader|NewAttemptReader|ProvideEndpointStateReader|NewListEndpointDeliveries|NewListDeliveryAttempts|NewSummarizeDeliveries|NewListMessageDeliveries|ProvideDispatchHandler|DispatchRoutes|ProvideDeliveryReader|NewDeliveryOutbox|Dispatch'
+out=$(echo "$api_graph" | grep -oE '\b[A-Z][A-Za-z0-9]*' | grep -E 'Delivery|Attempt|Queue|Catalog|Sender|Claim|Dispatch|Retry|Jitter|Lease|Runner|Worker' | grep -vxE "$DISPATCH_READ_SIDE" | sort -u)
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: the API graph in wire/wire_gen.go uses dispatch machinery outside the read side (ADR 0002)"
 	echo "$out"
 	fail=1
 fi

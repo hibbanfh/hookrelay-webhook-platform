@@ -41,8 +41,8 @@ var messageDataSet = wire.NewSet(
 var MessagePayloadsSet = wire.NewSet(messageDataSet, messageuc.NewGetMessagePayloads)
 
 // MessageSet builds the message module and binds the libraries to its ports. The message module
-// reads endpoints and appends deliveries through its own repositories (ADR 0013), so it needs no
-// adapter in adapters.go.
+// reads endpoints and appends deliveries through its own repositories (ADR 0013). It shows
+// deliveries it does not own through ProvideDeliveryReader, an adapter over dispatch (ADR 0015).
 var MessageSet = wire.NewSet(
 	messageDataSet,
 	ProvideMessageClock, ProvideMessageIDs, ProvideMessageTx,
@@ -56,6 +56,9 @@ var MessageSet = wire.NewSet(
 
 	wire.Struct(new(messageuc.PublishMessageDeps), "*"),
 	ProvidePublishMessage,
+	messageuc.NewListMessages,
+	messageuc.NewGetMessage,
+	ProvideDeliveryReader,
 	ProvideMessageHandler,
 	wire.Struct(new(MessageRoutes), "*"),
 )
@@ -80,9 +83,11 @@ func ProvidePublishMessage(deps messageuc.PublishMessageDeps, cfg config.Config)
 	return messageuc.NewPublishMessage(deps, cfg.IdempotencyTTL)
 }
 
-// ProvideMessageHandler builds the handler from the use case.
-func ProvideMessageHandler(publish *messageuc.PublishMessage, resp httpx.Responder) *messagehttp.Handler {
-	return messagehttp.NewHandler(messagehttp.UseCases{Publish: publish}, resp)
+// ProvideMessageHandler builds the handler from the three route use cases.
+func ProvideMessageHandler(
+	publish *messageuc.PublishMessage, list *messageuc.ListMessages, get *messageuc.GetMessage, resp httpx.Responder,
+) *messagehttp.Handler {
+	return messagehttp.NewHandler(messagehttp.UseCases{Publish: publish, List: list, Get: get}, resp)
 }
 
 // The three providers below satisfy the ports of the message module from the shared libraries,

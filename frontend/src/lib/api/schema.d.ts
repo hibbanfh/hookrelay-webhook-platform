@@ -179,7 +179,14 @@ export interface paths {
             };
             cookie?: never;
         };
-        /** List one endpoint's deliveries, newest first, optionally filtered by status */
+        /**
+         * List one endpoint's deliveries, newest first, optionally filtered by status
+         * @description Ordered by `created_at` descending (the publish time of the message), then `id` descending. A disabled
+         *     endpoint is still listed. Order of checks: a malformed path ID is `404`; then `status`, `limit` and
+         *     `cursor` are validated (`400`, the same for every ID, so it reveals nothing); then an unknown endpoint or
+         *     one of another project is `404 not_found`. The cursor does not remember the `status` filter: send the same
+         *     `status` with every page (ADR 0015).
+         */
         get: operations["listEndpointDeliveries"];
         put?: never;
         post?: never;
@@ -196,7 +203,15 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List messages, newest first, with a delivery summary */
+        /**
+         * List messages, newest first, with a delivery summary
+         * @description Ordered by `created_at` descending, then `id` descending. Items never contain `payload` (fetch one message
+         *     for it). `delivery_summary` counts the message's deliveries by status at read time; it is read just after
+         *     the page, so it can be a few milliseconds newer than the page itself (ADR 0015). A message published while
+         *     no endpoint was enabled has all counts at `0`. A message whose publish commits while you page can appear
+         *     on page 1 after you have read page 2 (its `created_at` is taken before its transaction commits); refresh
+         *     page 1 to see the newest messages.
+         */
         get: operations["listMessages"];
         put?: never;
         /**
@@ -247,7 +262,9 @@ export interface paths {
         /**
          * Get a message with its exact payload and all its deliveries
          * @description `payload` is returned byte-for-byte as published (embedded as raw JSON). `deliveries` is not paginated:
-         *     a message has at most one delivery per endpoint, and a project has at most 20 endpoints.
+         *     a message has at most one delivery per endpoint, and a project has at most 20 endpoints. Deliveries are
+         *     ordered by `id` ascending (the order they were created at publish). It is an empty array when no endpoint
+         *     was enabled at publish.
          */
         get: operations["getMessage"];
         put?: never;
@@ -270,7 +287,13 @@ export interface paths {
         };
         /**
          * List a delivery's attempts, oldest first
-         * @description Ordered by `attempt_number` ascending (the one exception to newest-first lists).
+         * @description Ordered by `attempt_number` ascending (the one exception to newest-first lists). Paginated like every list:
+         *     the default `limit` of 20 holds the whole default retry schedule (6 automatic attempts) in one page, and
+         *     manual replays (US-007) can add attempts without bound. The cursor of this list encodes an attempt number,
+         *     so a cursor from another list returns `400` (field `cursor`). A delivery with no finished attempt yet
+         *     returns an empty `data`. An attempt in flight is not listed until it finishes. A delivery that failed
+         *     because its endpoint was disabled has a last attempt with `error: endpoint_disabled`, `response_status:
+         *     null` and `duration_ms: 0` (no request was made).
          */
         get: operations["listDeliveryAttempts"];
         put?: never;
@@ -554,11 +577,17 @@ export interface components {
             event_type: components["schemas"]["EventType"];
             created_at: components["schemas"]["Timestamp"];
         };
+        /**
+         * @description How many of the message's deliveries are in each status right now (one delivery per endpoint that was
+         *     enabled at publish). A delivery with an attempt in flight counts as `pending`. The three counts add up to
+         *     the number of deliveries.
+         */
         DeliveryCounts: {
             pending: number;
             succeeded: number;
             failed: number;
         };
+        /** @description A list item. It never contains `payload`, so a page stays small whatever the payload sizes. */
         MessageSummary: {
             id: components["schemas"]["MessageID"];
             event_type: components["schemas"]["EventType"];
@@ -601,8 +630,13 @@ export interface components {
              *     `null` when not `pending`.
              */
             next_attempt_at: string | null;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description `started_at` of the latest finished attempt (equal to that attempt's `started_at` in the attempt list).
+             *     `null` until the first attempt finishes.
+             */
             last_attempt_at: string | null;
+            /** @description When the delivery was created, which is the publish time of its message. */
             created_at: components["schemas"]["Timestamp"];
         };
         DeliveryList: {
@@ -614,18 +648,35 @@ export interface components {
          * @enum {string|null}
          */
         AttemptError: "timeout" | "connection_error" | "dns_error" | "destination_blocked" | "endpoint_disabled" | null;
-        /** @enum {string} */
+        /**
+         * @description Why the attempt was made.
+         * @enum {string}
+         */
         AttemptTrigger: "automatic" | "manual";
         Attempt: {
             id: components["schemas"]["AttemptID"];
             delivery_id: components["schemas"]["DeliveryID"];
+            /** @description 1 for the first attempt; keeps counting across retries and manual replays. Unique per delivery. */
             attempt_number: number;
+            /** @description `automatic` for the first attempt and scheduled retries, `manual` for a replay (US-007). */
             trigger: components["schemas"]["AttemptTrigger"];
+            /** @description When the worker started the attempt (before DNS and connect). */
             started_at: components["schemas"]["Timestamp"];
+            /** @description Milliseconds from `started_at` until the response body was read or the attempt failed. `0` when no request was made (`endpoint_disabled`). */
             duration_ms: number;
+            /** @description HTTP status the receiver answered with (redirects are not followed, so `3xx` appears as is). `null` when there was no response (see `error`). */
             response_status: number | null;
-            /** @description First 4 KB of the response body as UTF-8 (invalid bytes replaced). `null` if there was no response. */
+            /**
+             * @description The first 4096 **bytes** of the response body as UTF-8 (invalid bytes replaced with U+FFFD, NUL bytes
+             *     removed, cut at a character boundary), so it is never more than 4 KB however large the response was.
+             *     `""` when the receiver answered with an empty body; `null` when there was no response. Treat it as
+             *     untrusted text: render it escaped, never as HTML.
+             */
             response_body: string | null;
+            /**
+             * @description `true` when the receiver sent more than 4096 bytes (or sanitizing pushed it over) and `response_body`
+             *     holds only the beginning. Always `false` when `response_body` is `null`.
+             */
             response_body_truncated: boolean;
             error: components["schemas"]["AttemptError"];
         };
@@ -826,9 +877,12 @@ export interface components {
         };
     };
     parameters: {
-        /** @description Page size. Values above 100 return `400 validation_error` (field `limit`). */
+        /** @description Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`). */
         Limit: number;
-        /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
+        /**
+         * @description Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+         *     different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
+         */
         Cursor: string;
         /** @description A value that is not a well-formed endpoint ID returns `404 not_found`, the same as an unknown ID. */
         EndpointID: components["schemas"]["EndpointID"];
@@ -1012,9 +1066,12 @@ export interface operations {
     listEndpoints: {
         parameters: {
             query?: {
-                /** @description Page size. Values above 100 return `400 validation_error` (field `limit`). */
+                /** @description Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`). */
                 limit?: components["parameters"]["Limit"];
-                /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
+                /**
+                 * @description Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+                 *     different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
+                 */
                 cursor?: components["parameters"]["Cursor"];
             };
             header?: never;
@@ -1177,11 +1234,17 @@ export interface operations {
     listEndpointDeliveries: {
         parameters: {
             query?: {
-                /** @description Only return deliveries in this status. Any other value returns `400 validation_error`. */
+                /**
+                 * @description Only return deliveries in this status. Absent means every status. An empty value, any other value,
+                 *     or the parameter sent more than once returns `400 validation_error` with field `status`.
+                 */
                 status?: components["schemas"]["DeliveryStatus"];
-                /** @description Page size. Values above 100 return `400 validation_error` (field `limit`). */
+                /** @description Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`). */
                 limit?: components["parameters"]["Limit"];
-                /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
+                /**
+                 * @description Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+                 *     different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
+                 */
                 cursor?: components["parameters"]["Cursor"];
             };
             header?: never;
@@ -1213,9 +1276,12 @@ export interface operations {
     listMessages: {
         parameters: {
             query?: {
-                /** @description Page size. Values above 100 return `400 validation_error` (field `limit`). */
+                /** @description Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`). */
                 limit?: components["parameters"]["Limit"];
-                /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
+                /**
+                 * @description Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+                 *     different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
+                 */
                 cursor?: components["parameters"]["Cursor"];
             };
             header?: never;
@@ -1327,9 +1393,12 @@ export interface operations {
     listDeliveryAttempts: {
         parameters: {
             query?: {
-                /** @description Page size. Values above 100 return `400 validation_error` (field `limit`). */
+                /** @description Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`). */
                 limit?: components["parameters"]["Limit"];
-                /** @description Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`). */
+                /**
+                 * @description Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+                 *     different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
+                 */
                 cursor?: components["parameters"]["Cursor"];
             };
             header?: never;

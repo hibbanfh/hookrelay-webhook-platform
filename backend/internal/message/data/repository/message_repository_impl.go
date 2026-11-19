@@ -6,6 +6,7 @@ package repositoryimpl
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"hookrelay/internal/message/data/source"
 	"hookrelay/internal/message/domain/entity"
@@ -47,6 +48,19 @@ func (r *MessageRepositoryImpl) GetMany(ctx context.Context, ids []string) ([]en
 	out := make([]entity.Message, 0, len(rows))
 	for _, m := range rows {
 		out = append(out, toMessageEntity(m))
+	}
+	return out, nil
+}
+
+// List returns one newest-first page of message headers.
+func (r *MessageRepositoryImpl) List(ctx context.Context, q repository.ListQuery) ([]entity.MessageHeader, error) {
+	rows, err := r.source.List(ctx, toListParams(q))
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+	out := make([]entity.MessageHeader, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, toHeaderEntity(m))
 	}
 	return out, nil
 }

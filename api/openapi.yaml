@@ -296,11 +296,19 @@ paths:
       tags: [deliveries]
       operationId: listEndpointDeliveries
       summary: List one endpoint's deliveries, newest first, optionally filtered by status
+      description: |
+        Ordered by `created_at` descending (the publish time of the message), then `id` descending. A disabled
+        endpoint is still listed. Order of checks: a malformed path ID is `404`; then `status`, `limit` and
+        `cursor` are validated (`400`, the same for every ID, so it reveals nothing); then an unknown endpoint or
+        one of another project is `404 not_found`. The cursor does not remember the `status` filter: send the same
+        `status` with every page (ADR 0015).
       parameters:
         - name: status
           in: query
           required: false
-          description: Only return deliveries in this status. Any other value returns `400 validation_error`.
+          description: |
+            Only return deliveries in this status. Absent means every status. An empty value, any other value,
+            or the parameter sent more than once returns `400 validation_error` with field `status`.
           schema: { $ref: "#/components/schemas/DeliveryStatus" }
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
@@ -322,6 +330,13 @@ paths:
       tags: [messages]
       operationId: listMessages
       summary: List messages, newest first, with a delivery summary
+      description: |
+        Ordered by `created_at` descending, then `id` descending. Items never contain `payload` (fetch one message
+        for it). `delivery_summary` counts the message's deliveries by status at read time; it is read just after
+        the page, so it can be a few milliseconds newer than the page itself (ADR 0015). A message published while
+        no endpoint was enabled has all counts at `0`. A message whose publish commits while you page can appear
+        on page 1 after you have read page 2 (its `created_at` is taken before its transaction commits); refresh
+        page 1 to see the newest messages.
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
@@ -412,7 +427,9 @@ paths:
       summary: Get a message with its exact payload and all its deliveries
       description: |
         `payload` is returned byte-for-byte as published (embedded as raw JSON). `deliveries` is not paginated:
-        a message has at most one delivery per endpoint, and a project has at most 20 endpoints.
+        a message has at most one delivery per endpoint, and a project has at most 20 endpoints. Deliveries are
+        ordered by `id` ascending (the order they were created at publish). It is an empty array when no endpoint
+        was enabled at publish.
       responses:
         "200":
           description: The message.
@@ -432,7 +449,14 @@ paths:
       tags: [deliveries]
       operationId: listDeliveryAttempts
       summary: List a delivery's attempts, oldest first
-      description: Ordered by `attempt_number` ascending (the one exception to newest-first lists).
+      description: |
+        Ordered by `attempt_number` ascending (the one exception to newest-first lists). Paginated like every list:
+        the default `limit` of 20 holds the whole default retry schedule (6 automatic attempts) in one page, and
+        manual replays (US-007) can add attempts without bound. The cursor of this list encodes an attempt number,
+        so a cursor from another list returns `400` (field `cursor`). A delivery with no finished attempt yet
+        returns an empty `data`. An attempt in flight is not listed until it finishes. A delivery that failed
+        because its endpoint was disabled has a last attempt with `error: endpoint_disabled`, `response_status:
+        null` and `duration_ms: 0` (no request was made).
       parameters:
         - $ref: "#/components/parameters/Limit"
         - $ref: "#/components/parameters/Cursor"
@@ -625,13 +649,15 @@ components:
       name: limit
       in: query
       required: false
-      description: Page size. Values above 100 return `400 validation_error` (field `limit`).
+      description: Page size. Values above 100, or a `limit` sent more than once, return `400 validation_error` (field `limit`).
       schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
     Cursor:
       name: cursor
       in: query
       required: false
-      description: Opaque `next_cursor` from the previous page. A malformed cursor returns `400` (field `cursor`).
+      description: |
+        Opaque `next_cursor` from the previous page of the same list. A malformed cursor, or a cursor taken from a
+        different kind of list, returns `400` (field `cursor`); so does a `cursor` sent more than once. Cursors do not expire.
       schema: { type: string, maxLength: 512 }
     EndpointID:
       name: endpoint_id
@@ -949,6 +975,10 @@ components:
     DeliveryCounts:
       type: object
       required: [pending, succeeded, failed]
+      description: |
+        How many of the message's deliveries are in each status right now (one delivery per endpoint that was
+        enabled at publish). A delivery with an attempt in flight counts as `pending`. The three counts add up to
+        the number of deliveries.
       properties:
         pending: { type: integer, minimum: 0 }
         succeeded: { type: integer, minimum: 0 }
@@ -956,6 +986,7 @@ components:
     MessageSummary:
       type: object
       required: [id, event_type, created_at, delivery_summary]
+      description: A list item. It never contains `payload`, so a page stays small whatever the payload sizes.
       properties:
         id: { $ref: "#/components/schemas/MessageID" }
         event_type: { $ref: "#/components/schemas/EventType" }
@@ -1015,7 +1046,12 @@ components:
         last_attempt_at:
           type: [string, "null"]
           format: date-time
-        created_at: { $ref: "#/components/schemas/Timestamp" }
+          description: |
+            `started_at` of the latest finished attempt (equal to that attempt's `started_at` in the attempt list).
+            `null` until the first attempt finishes.
+        created_at:
+          $ref: "#/components/schemas/Timestamp"
+          description: When the delivery was created, which is the publish time of its message.
     DeliveryList:
       type: object
       required: [data, next_cursor]
@@ -1031,6 +1067,7 @@ components:
     AttemptTrigger:
       type: string
       enum: [automatic, manual]
+      description: Why the attempt was made.
     Attempt:
       type: object
       required:
@@ -1038,19 +1075,38 @@ components:
       properties:
         id: { $ref: "#/components/schemas/AttemptID" }
         delivery_id: { $ref: "#/components/schemas/DeliveryID" }
-        attempt_number: { type: integer, minimum: 1 }
-        trigger: { $ref: "#/components/schemas/AttemptTrigger" }
-        started_at: { $ref: "#/components/schemas/Timestamp" }
-        duration_ms: { type: integer, minimum: 0 }
+        attempt_number:
+          type: integer
+          minimum: 1
+          description: 1 for the first attempt; keeps counting across retries and manual replays. Unique per delivery.
+        trigger:
+          $ref: "#/components/schemas/AttemptTrigger"
+          description: "`automatic` for the first attempt and scheduled retries, `manual` for a replay (US-007)."
+        started_at:
+          $ref: "#/components/schemas/Timestamp"
+          description: When the worker started the attempt (before DNS and connect).
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: Milliseconds from `started_at` until the response body was read or the attempt failed. `0` when no request was made (`endpoint_disabled`).
         response_status:
           type: [integer, "null"]
           minimum: 100
           maximum: 599
+          description: HTTP status the receiver answered with (redirects are not followed, so `3xx` appears as is). `null` when there was no response (see `error`).
         response_body:
           type: [string, "null"]
           maxLength: 4096
-          description: First 4 KB of the response body as UTF-8 (invalid bytes replaced). `null` if there was no response.
-        response_body_truncated: { type: boolean }
+          description: |
+            The first 4096 **bytes** of the response body as UTF-8 (invalid bytes replaced with U+FFFD, NUL bytes
+            removed, cut at a character boundary), so it is never more than 4 KB however large the response was.
+            `""` when the receiver answered with an empty body; `null` when there was no response. Treat it as
+            untrusted text: render it escaped, never as HTML.
+        response_body_truncated:
+          type: boolean
+          description: |
+            `true` when the receiver sent more than 4096 bytes (or sanitizing pushed it over) and `response_body`
+            holds only the beginning. Always `false` when `response_body` is `null`.
         error: { $ref: "#/components/schemas/AttemptError" }
     AttemptList:
       type: object

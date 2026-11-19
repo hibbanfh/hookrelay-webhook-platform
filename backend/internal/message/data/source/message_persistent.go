@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -23,10 +24,33 @@ SELECT id, project_id, event_type, payload, created_at
 FROM messages
 WHERE id = $1 AND project_id = $2`
 
+const listFirstPageSQL = `
+SELECT id, project_id, event_type, created_at
+FROM messages
+WHERE project_id = $1
+ORDER BY created_at DESC, id DESC
+LIMIT $2`
+
+const listNextPageSQL = `
+SELECT id, project_id, event_type, created_at
+FROM messages
+WHERE project_id = $1 AND (created_at, id) < ($3::timestamptz, $4::text)
+ORDER BY created_at DESC, id DESC
+LIMIT $2`
+
 const getMessagesByIDsSQL = `
 SELECT id, project_id, event_type, payload, created_at
 FROM messages
 WHERE id = ANY($1::text[])`
+
+// ListParams selects one page. HasAfter says whether AfterCreatedAt and AfterID are set.
+type ListParams struct {
+	ProjectID      string
+	Limit          int
+	HasAfter       bool
+	AfterCreatedAt time.Time
+	AfterID        string
+}
 
 // MessagePersistent runs the messages table queries.
 type MessagePersistent interface {
@@ -36,6 +60,8 @@ type MessagePersistent interface {
 	GetByID(ctx context.Context, projectID, id string) (model.Message, error)
 	// GetByIDs returns the rows that exist among ids, with no project scope.
 	GetByIDs(ctx context.Context, ids []string) ([]model.Message, error)
+	// List returns up to p.Limit rows of the project without the payload column, newest first.
+	List(ctx context.Context, p ListParams) ([]model.MessageHeader, error)
 }
 
 // MessagePersistentImpl implements MessagePersistent on PostgreSQL.
@@ -86,5 +112,34 @@ func (s *MessagePersistentImpl) GetByIDs(ctx context.Context, ids []string) ([]m
 func scanMessage(row pgx.CollectableRow) (model.Message, error) {
 	var m model.Message
 	err := row.Scan(&m.ID, &m.ProjectID, &m.EventType, &m.Payload, &m.CreatedAt)
+	return m, err
+}
+
+// List returns one keyset page, served by messages_project_created_idx. The statements do not
+// select payload: a page of 100 payloads of 256 KB would be 25 MB.
+func (s *MessagePersistentImpl) List(ctx context.Context, p ListParams) ([]model.MessageHeader, error) {
+	sql, args := listStatement(p)
+	rows, err := postgres.Executor(ctx, s.db).Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query message headers: %w", err)
+	}
+	defer rows.Close()
+	out, err := pgx.CollectRows(rows, scanHeader)
+	if err != nil {
+		return nil, fmt.Errorf("read message headers: %w", err)
+	}
+	return out, nil
+}
+
+func listStatement(p ListParams) (sql string, args []any) {
+	if !p.HasAfter {
+		return listFirstPageSQL, []any{p.ProjectID, p.Limit}
+	}
+	return listNextPageSQL, []any{p.ProjectID, p.Limit, p.AfterCreatedAt, p.AfterID}
+}
+
+func scanHeader(row pgx.CollectableRow) (model.MessageHeader, error) {
+	var m model.MessageHeader
+	err := row.Scan(&m.ID, &m.ProjectID, &m.EventType, &m.CreatedAt)
 	return m, err
 }

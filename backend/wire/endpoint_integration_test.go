@@ -177,6 +177,10 @@ func testNeedsCredential(t *testing.T, a api) {
 		{http.MethodGet, "/v1/endpoints/" + id, ""},
 		{http.MethodPatch, "/v1/endpoints/" + id, `{"enabled":false}`},
 		{http.MethodGet, "/v1/endpoints/" + id + "/secret", ""},
+		{http.MethodGet, "/v1/messages", ""},
+		{http.MethodGet, "/v1/messages/msg_01JC3ZM2H7Y9D4E6F8G0J1K2M3", ""},
+		{http.MethodGet, "/v1/endpoints/" + id + "/deliveries", ""},
+		{http.MethodGet, "/v1/deliveries/dlv_01JC3ZM2H7Y9D4E6F8G0J1K2M3/attempts", ""},
 	}
 	for _, rt := range routes {
 		t.Run(rt.method+" "+rt.path, func(t *testing.T) {

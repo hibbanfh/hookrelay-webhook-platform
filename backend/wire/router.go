@@ -25,6 +25,7 @@ type RouterDeps struct {
 	Project  ProjectRoutes
 	Endpoint EndpointRoutes
 	Message  MessageRoutes
+	Dispatch DispatchRoutes
 }
 
 // NewRouter builds the routes and wraps them in the middleware chain.
@@ -37,6 +38,7 @@ func NewRouter(d RouterDeps) http.Handler {
 	d.Project.Register(mux)
 	d.Endpoint.Register(mux)
 	d.Message.Register(mux)
+	d.Dispatch.Register(mux)
 	return httpx.Chain(httpx.JSONFallback(mux),
 		httpx.WithRequestID(func() string { return d.IDs.New(requestIDPrefix) }),
 		httpx.AccessLog(d.Log, d.Clock),

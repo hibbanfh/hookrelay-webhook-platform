@@ -20,7 +20,7 @@ func toDelivery(m model.ClaimedDelivery, lease entity.Lease) entity.Delivery {
 	return entity.Delivery{
 		ID: m.ID, ProjectID: m.ProjectID, MessageID: m.MessageID, EndpointID: m.EndpointID,
 		Status: entity.StatusPending, Trigger: entity.Trigger(m.Trigger), AttemptCount: m.AttemptCount,
-		NextAttemptAt: &expires, Lease: lease,
+		NextAttemptAt: &expires, CreatedAt: m.CreatedAt.UTC(), Lease: lease,
 	}
 }
 
@@ -57,4 +57,34 @@ func toAttemptModel(a entity.Attempt) model.Attempt {
 		m.Error = &errText
 	}
 	return m
+}
+
+// toDeliveryEntity maps a row the read queries returned. Timestamps come back in the local zone
+// of the driver, so they are read as UTC.
+func toDeliveryEntity(m model.DeliveryRow) entity.Delivery {
+	return entity.Delivery{
+		ID: m.ID, ProjectID: m.ProjectID, MessageID: m.MessageID, EndpointID: m.EndpointID,
+		Status: entity.Status(m.Status), Trigger: entity.Trigger(m.Trigger), AttemptCount: m.AttemptCount,
+		NextAttemptAt: utcPtr(m.NextAttemptAt), LastAttemptAt: utcPtr(m.LastAttemptAt), CreatedAt: m.CreatedAt.UTC(),
+	}
+}
+
+// toAttempt is the inverse of toAttemptModel: NULL means the thing did not happen, so a missing
+// status is 0, a missing body is the empty ResponseBody and a missing error is ErrorNone.
+func toAttempt(m model.Attempt) entity.Attempt {
+	a := entity.Attempt{
+		ID: m.ID, ProjectID: m.ProjectID, DeliveryID: m.DeliveryID, Number: m.Number,
+		Trigger: entity.Trigger(m.Trigger), StartedAt: m.StartedAt.UTC(),
+		Duration: time.Duration(m.DurationMS) * time.Millisecond,
+	}
+	if m.ResponseStatus != nil {
+		a.StatusCode = int(*m.ResponseStatus)
+	}
+	if m.ResponseBody != nil {
+		a.Body = entity.ResponseBody{Text: *m.ResponseBody, Truncated: m.ResponseBodyTruncated}
+	}
+	if m.Error != nil {
+		a.Err = entity.AttemptError(*m.Error)
+	}
+	return a
 }

@@ -13,6 +13,7 @@ type Delivery struct {
 	AttemptCount  int
 	NextAttemptAt *time.Time
 	LastAttemptAt *time.Time
+	CreatedAt     time.Time
 	Lease         Lease
 }
 

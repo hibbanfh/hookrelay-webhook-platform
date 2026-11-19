@@ -11,6 +11,7 @@ import (
 	endpointrepository "hookrelay/internal/endpoint/domain/repository"
 	endpointuc "hookrelay/internal/endpoint/domain/usecase"
 	messageentity "hookrelay/internal/message/domain/entity"
+	messagerepository "hookrelay/internal/message/domain/repository"
 	messageuc "hookrelay/internal/message/domain/usecase"
 )
 
@@ -87,6 +88,10 @@ type fakeMessageStore struct {
 	rows  []messageentity.Message
 	err   error
 	calls int
+}
+
+func (f *fakeMessageStore) List(context.Context, messagerepository.ListQuery) ([]messageentity.MessageHeader, error) {
+	return nil, nil
 }
 
 func (f *fakeMessageStore) Create(context.Context, messageentity.Message) error { return nil }

@@ -4,7 +4,9 @@ import (
 	"fmt"
 
 	"hookrelay/internal/message/data/model"
+	"hookrelay/internal/message/data/source"
 	"hookrelay/internal/message/domain/entity"
+	"hookrelay/internal/message/domain/repository"
 )
 
 func toMessageModel(m entity.Message) model.Message {
@@ -45,4 +47,17 @@ func toDeliveryModels(deliveries []entity.PendingDelivery) []model.PendingDelive
 		})
 	}
 	return rows
+}
+
+func toListParams(q repository.ListQuery) source.ListParams {
+	p := source.ListParams{ProjectID: q.ProjectID, Limit: q.Limit}
+	if q.After != nil {
+		p.HasAfter, p.AfterCreatedAt, p.AfterID = true, q.After.CreatedAt, q.After.ID
+	}
+	return p
+}
+
+// toHeaderEntity reads the timestamp back in UTC: the driver returns it in the local zone.
+func toHeaderEntity(m model.MessageHeader) entity.MessageHeader {
+	return entity.MessageHeader{ID: m.ID, ProjectID: m.ProjectID, EventType: m.EventType, CreatedAt: m.CreatedAt.UTC()}
 }

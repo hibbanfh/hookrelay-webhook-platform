@@ -2,6 +2,7 @@ package wire
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/google/wire"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -9,6 +10,7 @@ import (
 	repositoryimpl "hookrelay/internal/dispatch/data/repository"
 	dispatchsource "hookrelay/internal/dispatch/data/source"
 	"hookrelay/internal/dispatch/data/webhookhttp"
+	dispatchhttp "hookrelay/internal/dispatch/delivery/presenter/http"
 	"hookrelay/internal/dispatch/delivery/worker"
 	dispatchentity "hookrelay/internal/dispatch/domain/entity"
 	dispatchrepo "hookrelay/internal/dispatch/domain/repository"
@@ -19,6 +21,7 @@ import (
 	"hookrelay/internal/library/postgres"
 	"hookrelay/internal/library/random"
 	"hookrelay/internal/platform/config"
+	"hookrelay/internal/platform/httpx"
 )
 
 // DispatchSet builds the dispatch module for the worker process: queue, sender, use cases and
@@ -116,3 +119,48 @@ func ProvideDispatchTx(m *postgres.TxManager) dispatchuc.TxManager { return m }
 
 // ProvideDispatchJitter binds the uniform random source to the dispatch JitterSource port.
 func ProvideDispatchJitter(u random.Uniform) dispatchentity.JitterSource { return u }
+
+// DispatchReadSet builds the read side of the dispatch module for the API process: the two
+// routes below /v1 and the two internal use cases the message module reads through an adapter
+// (ADR 0015). It has no sender and no worker, so a request path cannot make an outbound call
+// (ADR 0002). It needs GetEndpoint from EndpointSet for the ownership check.
+var DispatchReadSet = wire.NewSet(
+	ProvideDeliveryReadSource, ProvideAttemptSource,
+	wire.Bind(new(dispatchsource.DeliveryReadPersistent), new(*dispatchsource.DeliveryReadPersistentImpl)),
+	wire.Bind(new(dispatchsource.AttemptListPersistent), new(*dispatchsource.AttemptPersistentImpl)),
+	repositoryimpl.NewDeliveryReader,
+	repositoryimpl.NewAttemptReader,
+	ProvideEndpointStateReader,
+
+	dispatchuc.NewListEndpointDeliveries,
+	dispatchuc.NewListDeliveryAttempts,
+	dispatchuc.NewSummarizeDeliveries,
+	dispatchuc.NewListMessageDeliveries,
+
+	ProvideDispatchHandler,
+	wire.Struct(new(DispatchRoutes), "*"),
+)
+
+// DispatchRoutes is everything the router needs to register the dispatch routes. The guard is
+// the project module function type, so the dispatch module never imports the project module.
+type DispatchRoutes struct {
+	Handler *dispatchhttp.Handler
+	Guard   ProjectGuard
+}
+
+// Register adds the dispatch routes to mux.
+func (d DispatchRoutes) Register(mux *http.ServeMux) {
+	dispatchhttp.Routes(mux, d.Handler, d.Guard)
+}
+
+// ProvideDeliveryReadSource hands the pool to the delivery read source as the Querier it needs.
+func ProvideDeliveryReadSource(pool *pgxpool.Pool) *dispatchsource.DeliveryReadPersistentImpl {
+	return dispatchsource.NewDeliveryReadPersistent(pool)
+}
+
+// ProvideDispatchHandler builds the HTTP handler from the two route use cases.
+func ProvideDispatchHandler(
+	deliveries *dispatchuc.ListEndpointDeliveries, attempts *dispatchuc.ListDeliveryAttempts, resp httpx.Responder,
+) *dispatchhttp.Handler {
+	return dispatchhttp.NewHandler(dispatchhttp.UseCases{EndpointDeliveries: deliveries, Attempts: attempts}, resp)
+}

@@ -14,12 +14,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit, err := httpx.ParseLimit(r.URL.Query().Get("limit"))
+	limit, err := httpx.LimitFromQuery(r)
 	if err != nil {
 		h.fail(w, r, err)
 		return
 	}
-	after, err := parseAfter(r.URL.Query().Get("cursor"))
+	after, err := parseAfter(r)
 	if err != nil {
 		h.fail(w, r, err)
 		return
@@ -34,7 +34,11 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 
 // parseAfter decodes the cursor. An absent cursor is the first page. The cursor ID must be a
 // well-formed endpoint ID, so a forged cursor never reaches the database as an arbitrary string.
-func parseAfter(raw string) (*entity.PageAnchor, error) {
+func parseAfter(r *http.Request) (*entity.PageAnchor, error) {
+	raw, err := httpx.CursorFromQuery(r)
+	if err != nil {
+		return nil, err
+	}
 	if raw == "" {
 		return nil, nil
 	}

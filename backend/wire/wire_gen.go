@@ -149,9 +149,26 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Tx:        txManager2,
 	}
 	publishMessage := ProvidePublishMessage(publishMessageDeps, cfg)
-	handler2 := ProvideMessageHandler(publishMessage, responder)
+	deliveryReadPersistentImpl := ProvideDeliveryReadSource(pool)
+	repositoryDeliveryReader := repositoryimpl4.NewDeliveryReader(deliveryReadPersistentImpl)
+	summarizeDeliveries := usecase4.NewSummarizeDeliveries(repositoryDeliveryReader)
+	listMessageDeliveries := usecase4.NewListMessageDeliveries(repositoryDeliveryReader)
+	deliveryReader2 := ProvideDeliveryReader(summarizeDeliveries, listMessageDeliveries)
+	listMessages := usecase3.NewListMessages(messageRepository, deliveryReader2)
+	getMessage := usecase3.NewGetMessage(messageRepository, deliveryReader2)
+	handler2 := ProvideMessageHandler(publishMessage, listMessages, getMessage, responder)
 	messageRoutes := MessageRoutes{
 		Handler: handler2,
+		Guard:   projectGuard,
+	}
+	repositoryEndpointStateReader := ProvideEndpointStateReader(getEndpoint)
+	listEndpointDeliveries := usecase4.NewListEndpointDeliveries(repositoryDeliveryReader, repositoryEndpointStateReader)
+	attemptPersistentImpl := ProvideAttemptSource(pool)
+	attemptReader := repositoryimpl4.NewAttemptReader(attemptPersistentImpl)
+	listDeliveryAttempts := usecase4.NewListDeliveryAttempts(repositoryDeliveryReader, attemptReader)
+	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, responder)
+	dispatchRoutes := DispatchRoutes{
+		Handler: handler3,
 		Guard:   projectGuard,
 	}
 	routerDeps := RouterDeps{
@@ -163,6 +180,7 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Project:  projectRoutes,
 		Endpoint: endpointRoutes,
 		Message:  messageRoutes,
+		Dispatch: dispatchRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	api := &API{
@@ -281,9 +299,26 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Tx:        txManager2,
 	}
 	publishMessage := ProvidePublishMessage(publishMessageDeps, cfg)
-	handler2 := ProvideMessageHandler(publishMessage, responder)
+	deliveryReadPersistentImpl := ProvideDeliveryReadSource(pool)
+	repositoryDeliveryReader := repositoryimpl4.NewDeliveryReader(deliveryReadPersistentImpl)
+	summarizeDeliveries := usecase4.NewSummarizeDeliveries(repositoryDeliveryReader)
+	listMessageDeliveries := usecase4.NewListMessageDeliveries(repositoryDeliveryReader)
+	deliveryReader2 := ProvideDeliveryReader(summarizeDeliveries, listMessageDeliveries)
+	listMessages := usecase3.NewListMessages(messageRepository, deliveryReader2)
+	getMessage := usecase3.NewGetMessage(messageRepository, deliveryReader2)
+	handler2 := ProvideMessageHandler(publishMessage, listMessages, getMessage, responder)
 	messageRoutes := MessageRoutes{
 		Handler: handler2,
+		Guard:   projectGuard,
+	}
+	repositoryEndpointStateReader := ProvideEndpointStateReader(getEndpoint)
+	listEndpointDeliveries := usecase4.NewListEndpointDeliveries(repositoryDeliveryReader, repositoryEndpointStateReader)
+	attemptPersistentImpl := ProvideAttemptSource(pool)
+	attemptReader := repositoryimpl4.NewAttemptReader(attemptPersistentImpl)
+	listDeliveryAttempts := usecase4.NewListDeliveryAttempts(repositoryDeliveryReader, attemptReader)
+	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, responder)
+	dispatchRoutes := DispatchRoutes{
+		Handler: handler3,
 		Guard:   projectGuard,
 	}
 	routerDeps := RouterDeps{
@@ -295,6 +330,7 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Project:  projectRoutes,
 		Endpoint: endpointRoutes,
 		Message:  messageRoutes,
+		Dispatch: dispatchRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	return httpHandler, nil
@@ -511,7 +547,7 @@ var infra = wire.NewSet(logger.ProviderSet, LoggerOptions, postgres.ProviderSet,
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet, MessageSet, httpclient.ProviderSet, HTTPClientOptions,
+	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchReadSet, httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger, wire.Struct(new(RouterDeps), "*"), NewRouter,
 )
 

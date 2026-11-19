@@ -34,8 +34,15 @@ func (f *fakeDeliverySource) CompleteFenced(_ context.Context, u model.DeliveryU
 }
 
 type fakeAttemptSource struct {
-	got model.Attempt
-	err error
+	got  model.Attempt
+	err  error
+	rows []model.Attempt
+	list source.AttemptListParams
+}
+
+func (f *fakeAttemptSource) ListByDelivery(_ context.Context, p source.AttemptListParams) ([]model.Attempt, error) {
+	f.list = p
+	return f.rows, f.err
 }
 
 func (f *fakeAttemptSource) Insert(_ context.Context, a model.Attempt) error {

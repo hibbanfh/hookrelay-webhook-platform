@@ -11,3 +11,12 @@ type Message struct {
 	Payload   []byte
 	CreatedAt time.Time
 }
+
+// MessageHeader is a messages row without the payload column, which is what the list query
+// returns. It has no payload field, so the payload cannot be selected by mistake.
+type MessageHeader struct {
+	ID        string
+	ProjectID string
+	EventType string
+	CreatedAt time.Time
+}

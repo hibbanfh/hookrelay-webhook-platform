@@ -114,3 +114,12 @@ func writeAPIError(w http.ResponseWriter, apiErr *Error) {
 	}
 	WriteJSON(w, apiErr.Status, errorBody{Error: apiErr})
 }
+
+// WriteRawJSON writes body, which must already be JSON, exactly as given. WriteJSON cannot do
+// this for a payload embedded as json.RawMessage: json.Encoder compacts it and escapes <, > and &,
+// and receivers verify signatures over the original bytes.
+func WriteRawJSON(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body) // error ignored for the reason given on WriteJSON
+}

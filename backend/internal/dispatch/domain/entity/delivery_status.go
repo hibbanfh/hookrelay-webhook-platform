@@ -12,3 +12,14 @@ const (
 	StatusSucceeded Status = "succeeded"
 	StatusFailed    Status = "failed"
 )
+
+// ParseStatus converts the text of a query parameter into a Status. It accepts the three
+// constants only, so a filter never reaches the database as an arbitrary string.
+func ParseStatus(s string) (Status, bool) {
+	switch status := Status(s); status {
+	case StatusPending, StatusSucceeded, StatusFailed:
+		return status, true
+	default:
+		return "", false
+	}
+}

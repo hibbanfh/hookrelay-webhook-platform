@@ -13,13 +13,23 @@ import (
 )
 
 // Use cases as the handler sees them (small interfaces make handler tests trivial).
-type messagePublisher interface {
-	Execute(ctx context.Context, in usecase.PublishMessageInput) (usecase.PublishMessageOutput, error)
-}
+type (
+	messagePublisher interface {
+		Execute(ctx context.Context, in usecase.PublishMessageInput) (usecase.PublishMessageOutput, error)
+	}
+	messageLister interface {
+		Execute(ctx context.Context, in usecase.ListMessagesInput) (usecase.ListMessagesOutput, error)
+	}
+	messageGetter interface {
+		Execute(ctx context.Context, in usecase.GetMessageInput) (usecase.GetMessageOutput, error)
+	}
+)
 
 // UseCases groups the message use cases.
 type UseCases struct {
 	Publish messagePublisher
+	List    messageLister
+	Get     messageGetter
 }
 
 // Handler serves the message routes.

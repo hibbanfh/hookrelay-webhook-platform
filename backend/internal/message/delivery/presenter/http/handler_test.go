@@ -251,7 +251,7 @@ func TestPublishMapsErrorsThroughOneTable(t *testing.T) {
 		{"validation names the field", fmt.Errorf("wrapped: %w", &domainerrors.ValidationError{Field: "payload", Reason: "must be a JSON object"}), 400, "validation_error", "payload"},
 		{"key validation names the header", &domainerrors.ValidationError{Field: "Idempotency-Key", Reason: "bad"}, 400, "validation_error", "Idempotency-Key"},
 		{"mismatch", fmt.Errorf("publish: %w", domainerrors.ErrIdempotencyMismatch), 422, "idempotency_key_mismatch", ""},
-		{"replay lookup miss is a server error", fmt.Errorf("get message: %w", domainerrors.ErrNotFound), 500, "internal", ""},
+		{"broken idempotency record is a server error", fmt.Errorf("replay: %w", domainerrors.ErrBrokenIdempotencyRecord), 500, "internal", ""},
 		{"unknown", errBoom, 500, "internal", ""},
 	}
 	for _, tt := range tests {
@@ -290,14 +290,6 @@ func TestPublishWithoutProjectInContextIsRefused(t *testing.T) {
 
 	if rec.Code != http.StatusUnauthorized || f.calls != 0 {
 		t.Fatalf("got %d, use case calls %d", rec.Code, f.calls)
-	}
-}
-
-func TestOnlyPostIsRegisteredUntilListExists(t *testing.T) {
-	rec := serve(newFake(), asProject, io.Discard, httptest.NewRequest(http.MethodGet, "/v1/messages", nil))
-
-	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != http.MethodPost {
-		t.Fatalf("got %d Allow=%q", rec.Code, rec.Header().Get("Allow"))
 	}
 }
 

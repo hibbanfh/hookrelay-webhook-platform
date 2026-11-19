@@ -1,7 +1,7 @@
 # Hookrelay: Architecture
 
 **Status:** v0.1 design, covering MVP scope (US-001 to US-008, US-010, US-025)
-**Owner:** Architect · **Last updated:** 2026-11-14
+**Owner:** Architect · **Last updated:** 2026-11-19
 **Contract:** [`api/openapi.yaml`](../api/openapi.yaml) · **Decisions:** [`docs/adr/`](adr/)
 
 > **In one paragraph:** Hookrelay is a Go modular monolith with two processes from one binary: an
@@ -284,7 +284,7 @@ domain's port or a CLI command.
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrLimitReached` (409, message names the limit) | |
 | Port | `EndpointRepository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` locks the `projects` row `FOR NO KEY UPDATE`, then counts in a second statement, and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
 | Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox` |
-| Port | `DeliveryTargetReader{GetTargets(ctx, ids) (TargetBatch{Targets, Unreadable}, error)}` | US-004. System-level batch read for the worker; opens each secret with `SecretCipher`. A secret that fails to open is listed in `Unreadable` instead of failing the batch. `GetState` follows in US-006/007. The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
+| Port | `DeliveryTargetReader{GetTargets(ctx, ids) (TargetBatch{Targets, Unreadable}, error)}` | US-004. System-level batch read for the worker; opens each secret with `SecretCipher`. A secret that fails to open is listed in `Unreadable` instead of failing the batch. The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
 | Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `library/netguard`. Non-nil means rejected; the use case converts it to `ValidationError{Field:"url"}` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `RandomSource`, `TxManager` | |
 | Use case | `CreateEndpoint` | `POST /v1/endpoints`. Flow: entity → URLPolicy → tx{CountForUpdate ≥ limit → `ErrLimitReached`; Create} |
@@ -293,7 +293,7 @@ domain's port or a CLI command.
 | Use case | `GetEndpointSecret` | `GET /v1/endpoints/{id}/secret` |
 | Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (whenever `url` is present) → UpdateFields |
 | Use case | `GetDeliveryTargets` | internal, batch `{project_id, url, enabled, secret}` by IDs for `dispatch.EndpointCatalog` (US-004, ADR 0014). One `WHERE id = ANY($1)` query |
-| Use case | `GetEndpointState` | internal, `{enabled}` scoped by project, or `ErrNotFound` (US-006/US-007) |
+| Use case (reused) | `GetEndpoint` | also behind `dispatch.EndpointStateReader` (adapter) for ownership and `enabled` checks (US-006/US-007). No separate `GetEndpointState` (ADR 0015) |
 | Use case | `ListDemoSigningSecrets` | internal, secrets of a project's endpoints whose URL starts with the demo receiver prefix (US-010) |
 
 ### 5.3 `message`: publish, idempotency, read model
@@ -310,10 +310,10 @@ Full plan: [`docs/plans/us-003.md`](plans/us-003.md). Decisions: ADR 0013.
 | Port | `IdempotencyStore{Reserve, Find}` | `Reserve` is one `INSERT ... ON CONFLICT DO UPDATE ... WHERE expires_at <= $now RETURNING` (§8.1, ADR 0013) |
 | Port (cross-module read) | `EndpointDirectory{EnabledEndpointIDs(ctx, projectID)}` | Implemented in `message/data` (`fanout_persistent.go`) on the `endpoints` table, read only (ADR 0013) |
 | Port (cross-module append) | `DeliveryOutbox{Enqueue(ctx, []PendingDelivery)}` | Implemented in `message/data` (`fanout_persistent.go`). One `INSERT ... SELECT FROM unnest(...)` that joins the publish tx via ctx (ADR 0013) |
-| Port (cross-domain) | `DeliveryReader{Summaries(ctx, projectID, msgIDs), ListForMessage(ctx, projectID, msgID)}` | → `dispatch.SummarizeDeliveries` / `dispatch.ListMessageDeliveries` (US-006) |
+| Port (cross-domain) | `DeliveryReader{Summaries(ctx, projectID, msgIDs) (map[msgID]DeliverySummary), ListForMessage(ctx, projectID, msgID) ([]MessageDelivery)}` | → `dispatch.SummarizeDeliveries` / `dispatch.ListMessageDeliveries` (US-006, ADR 0015). `MessageDelivery` and `DeliverySummary` are message-owned read values; the adapter maps from dispatch entities |
 | Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` | |
 | Use case | `PublishMessage` | `POST /v1/messages`. Returns `{Message, Replayed bool}` |
-| Use case | `ListMessages` | `GET /v1/messages`. One page query plus one `GROUP BY` summary query (no N+1) |
+| Use case | `ListMessages` | `GET /v1/messages`. One page query (no `payload` column) plus one `GROUP BY` summary query (no N+1, ADR 0015). `MessageRepository.List` returns `MessageHeader` values |
 | Use case | `GetMessage` | `GET /v1/messages/{id}`. Message plus ≤ 20 deliveries |
 | Use case | `GetMessagePayloads` | internal, batch by IDs for `dispatch.MessageCatalog` (worker, US-004). One `WHERE id = ANY($1)` query |
 
@@ -334,16 +334,18 @@ fenced completion, catalog adapters, shutdown).
 | Func | `Sign(key []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
 | Errors | `ErrLeaseLost`, `ErrSendAborted` (US-004); `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrConflict` (US-006/007) | |
 | Port | `DeliveryQueue{ClaimDue(ctx, now, limit, lease), Complete(ctx, delivery, leaseToken)}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that. US-007 adds `RequeueForReplay` |
-| Port | `AttemptRepository{Create}` | append-only. US-006 adds the reads (`Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}`) |
+| Port | `AttemptRepository{Create}` | append-only, worker only |
+| Port | `DeliveryReader{Get, ListByEndpoint, ListByMessage, CountByMessages}`, `AttemptReader{ListByDelivery}` | US-006 project-scoped reads, API graph only (plan: [`docs/plans/us-006.md`](plans/us-006.md)) |
 | Port (outbound) | `Sender{Send(ctx, SignedRequest) (Outcome, error)}` | `data/webhookhttp`: netguard-guarded client. Network failures are outcomes; the only error is `ErrSendAborted` |
-| Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids)}` | → `endpoint.GetDeliveryTargets` (adapter). US-006 adds `GetState` |
+| Port (cross-domain) | `EndpointCatalog{GetTargets(ctx, ids)}` | → `endpoint.GetDeliveryTargets` (adapter), worker only |
+| Port (cross-domain) | `EndpointStateReader{GetState(ctx, projectID, endpointID) (EndpointState{Enabled}, error)}` | → `endpoint.GetEndpoint` (adapter), API only; `ErrNotFound` for unknown/foreign (US-006, reused by US-007, ADR 0015) |
 | Port (cross-domain) | `MessageCatalog{GetPayloads(ctx, ids)}` | → `message.GetMessagePayloads` (adapter) |
 | Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` (US-004) | |
 | Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `{Jobs, Skipped}` (3 queries per batch) |
 | Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → tx{fenced `Complete`, `Attempts.Create`} |
 | Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` (US-007) |
 | Use case | `ListDeliveryAttempts` | `GET /v1/deliveries/{id}/attempts` (US-006) |
-| Use case | `ListEndpointDeliveries` | `GET /v1/endpoints/{id}/deliveries`. Ownership via `EndpointCatalog.GetState` → 404 (US-006) |
+| Use case | `ListEndpointDeliveries` | `GET /v1/endpoints/{id}/deliveries`. Ownership via `EndpointStateReader.GetState` → 404 (US-006) |
 | Use case | `SummarizeDeliveries` | internal, for `message.DeliveryReader` (US-006) |
 | Use case | `ListMessageDeliveries` | internal, for `message.DeliveryReader` (US-006) |
 | Adapter in | `delivery/worker.Runner` | poll loop, free-slot claiming, bounded `errgroup`, drain context, DB-error backoff, heartbeat (§8.2) |
@@ -367,7 +369,8 @@ The publish path needs no adapter. `message.EndpointDirectory` and `message.Deli
 | Consumer port | Implemented by calling | Used in |
 |---|---|---|
 | `message.DeliveryReader` | `dispatch.SummarizeDeliveries`, `dispatch.ListMessageDeliveries` | list/get message |
-| `dispatch.EndpointCatalog` | `endpoint.GetDeliveryTargets`, `endpoint.GetEndpointState` | worker, replay, endpoint deliveries |
+| `dispatch.EndpointCatalog` | `endpoint.GetDeliveryTargets` | worker |
+| `dispatch.EndpointStateReader` | `endpoint.GetEndpoint` | endpoint deliveries (US-006), replay (US-007) |
 | `dispatch.MessageCatalog` | `message.GetMessagePayloads` | worker |
 | `demoreceiver.SecretSource` | `endpoint.ListDemoSigningSecrets` | demo receiver |
 
@@ -560,7 +563,8 @@ erDiagram
 
 - **`payload bytea`, not `jsonb`:** `jsonb` normalizes whitespace, key order and duplicate
   keys. Signatures are computed over the exact bytes, and US-003/006 require byte-for-byte
-  round-trips. The API embeds the stored bytes as `json.RawMessage`.
+  round-trips. The API splices the stored bytes into the response and writes it raw: `json.RawMessage`
+  through `json.Encoder` would be compacted and HTML-escaped (`docs/plans/us-006.md` gap 1).
 - **`next_attempt_at` doubles as the visibility timeout:** while a delivery is in flight, it
   holds the lease expiry. One column and one partial index serve both "due" and "abandoned".
 - **`project_id` is denormalized onto `deliveries` and `attempts`** for scoped reads without
@@ -789,7 +793,7 @@ with gaps ≥ 0.9 s and ≥ 1.8 s. Retry state lives only in the row (`next_atte
 ### 8.4 Replay (US-007)
 
 `ReplayDelivery`: `Reader.Get(projectID, id)` (404 if missing or foreign) →
-`d.Replay(now)` (`ErrDeliveryPending` → 409) → `EndpointCatalog.GetState` (`!enabled` →
+`d.Replay(now)` (`ErrDeliveryPending` → 409) → `EndpointStateReader.GetState` (`!enabled` →
 `ErrEndpointDisabled` → 409 "endpoint is disabled") → `Repository.RequeueForReplay`:
 
 ```sql
@@ -865,7 +869,8 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 - **Growth:** `attempts` is append-only (≤ ~5 KB/row). Retention (US-016) deletes in batches. At
   scale, partition `attempts` and `messages` by month and drop partitions instead of deleting.
 - **N+1 avoided:** message list = 2 queries (page + `GROUP BY` counts). Worker batch = 3 queries
-  (claim + targets + payloads). Message detail = 2 queries. Auth = 1 indexed lookup per request.
+  (claim + targets + payloads). Message detail, endpoint deliveries and attempts = 2 queries each
+  (ADR 0015). Auth = 1 indexed lookup per request.
   A session request costs 1 Neon call per token per 5 s (cached, `singleflight`) plus 1 indexed
   lookup on `projects.neon_user_id`.
 - **Pools:** API `pgxpool` max 10, worker max 6. `statement_timeout = 5s` and
@@ -1059,13 +1064,13 @@ Full layer-ordered plan, verification of `ApplyOutcome` against §8.3, config ru
 swaps `NoRetry` for the schedule. No new use case, no migration, no new endpoint.
 
 ### US-006: Inspect
-1. `dispatch/domain/repository.go`: `Reader{Get, ListByEndpoint, ListByMessage, CountsByMessages, ListAttempts}`. `ports.go`: `EndpointCatalog.GetState`.
-2. `dispatch/usecase`: `list_delivery_attempts.go`, `list_endpoint_deliveries.go` (status filter typed, ownership → 404), `summarize_deliveries.go`, `list_message_deliveries.go`.
-3. `endpoint/usecase/get_endpoint_state.go`.
-4. `message/domain/ports.go`: `DeliveryReader`. `message/usecase`: `list_messages.go`, `get_message.go`.
-5. `dispatch/data/postgres` and `message/data/postgres`: keyset list queries, `GROUP BY` counts, attempts by number. Integration tests: A/B 404s, 1 MB body stored ≤ 4 KB with `truncated`.
-6. HTTP: `GET /v1/messages`, `GET /v1/messages/{id}` (payload as `RawMessage`), `GET /v1/deliveries/{id}/attempts`, `GET /v1/endpoints/{id}/deliveries` (invalid `status` → 400 `field: status`).
-7. Wiring: `deliveryReader`, `EndpointCatalog.GetState` adapters.
+Full layer-ordered plan, query shapes, contract notes and AC → test map: [`docs/plans/us-006.md`](plans/us-006.md).
+Decisions: ADR 0015 (summaries counted on read, cross-module reads through use cases, keyset cursors incl. the
+attempt-number cursor, per-statement consistency). Use cases: `message.ListMessages`, `message.GetMessage`,
+`dispatch.ListEndpointDeliveries`, `dispatch.ListDeliveryAttempts`, plus internal `dispatch.SummarizeDeliveries` and
+`dispatch.ListMessageDeliveries`. Ports: `message.DeliveryReader`, `MessageRepository.List`; `dispatch.DeliveryReader`,
+`dispatch.AttemptReader`, `dispatch.EndpointStateReader`. Adapters: `deliveryReader`, `endpointStateReader`. New Wire set
+`DispatchReadSet` (API graph only). **No migration**: every query is served by indexes from 0004/0005.
 
 ### US-007: Replay
 1. `dispatch/domain/delivery.go`: `Replay(now)` → `ErrDeliveryPending`. `ApplyOutcome`: manual means no retries. `repository.go`: `RequeueForReplay`.
@@ -1145,3 +1150,13 @@ swaps `NoRetry` for the schedule. No new use case, no migration, no new endpoint
     in the jitter multiply). The default schedule is far below it. Confirm, or name a different cap.
 20. **Q20 (US-005): Every non-2xx is retried, including `400`/`401`/`404`** (backlog note), so a misconfigured receiver
     gets 6 identical requests over about 1h18m. Accept until US-020 (`Retry-After`, `410 Gone`)?
+21. **Q21 (US-006): `endpoint_disabled` and `destination_blocked` count as `failed` in the message summary**, and an
+    attempt in flight counts as `pending`. There is no separate "in flight" bucket. Confirm the three buckets are enough.
+    **Resolved (PM default, accepted as designed): three buckets.**
+22. **Q22 (US-006): A message published while no endpoint was enabled shows `0/0/0`** and an empty `deliveries` array.
+    Should the dashboard call this out ("no endpoints were enabled")? No API change needed either way.
+    **Resolved (PM default, accepted as designed): `0/0/0` summary with an empty `deliveries` array.**
+23. **Q23 (US-006): Paging is not snapshot-stable.** A publish that commits late can land behind a cursor already handed
+    out, so "Load more" can miss it until page 1 is refreshed (the dashboard already polls). Accept, or do we need
+    commit-ordered paging (a sequence column + migration)?
+    **Resolved (PM default, accepted as designed): non-snapshot paging accepted; no migration.**

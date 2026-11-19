@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"hookrelay/internal/message/data/model"
+	"hookrelay/internal/message/data/source"
 )
 
 var errBoom = errors.New("boom")
@@ -18,6 +19,13 @@ type stubMessages struct {
 	row      model.Message
 	rows     []model.Message
 	err      error
+	headers  []model.MessageHeader
+	listIn   source.ListParams
+}
+
+func (s *stubMessages) List(_ context.Context, p source.ListParams) ([]model.MessageHeader, error) {
+	s.listIn = p
+	return s.headers, s.err
 }
 
 func (s *stubMessages) Insert(_ context.Context, m model.Message) error {

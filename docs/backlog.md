@@ -348,7 +348,7 @@ Notes / out of scope:
 
 ---
 
-### US-006: Inspect messages, deliveries and attempts            [status: todo]  [priority: P0]
+### US-006: Inspect messages, deliveries and attempts            [status: done]  [priority: P0]
 As a platform developer, I want to see every message, where it went, and what each attempt
 returned, so that I can answer "did my customer get the webhook?" without reading server logs.
 

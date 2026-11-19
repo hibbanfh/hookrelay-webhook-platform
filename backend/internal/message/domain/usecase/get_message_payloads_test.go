@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"hookrelay/internal/message/domain/entity"
+	"hookrelay/internal/message/domain/repository"
 	"hookrelay/internal/message/domain/usecase"
 )
 
@@ -19,6 +20,10 @@ func (p *payloadReader) Create(context.Context, entity.Message) error { return n
 
 func (p *payloadReader) Get(context.Context, string, string) (entity.Message, error) {
 	return entity.Message{}, nil
+}
+
+func (p *payloadReader) List(context.Context, repository.ListQuery) ([]entity.MessageHeader, error) {
+	return nil, nil
 }
 
 func (p *payloadReader) GetMany(context.Context, []string) ([]entity.Message, error) {

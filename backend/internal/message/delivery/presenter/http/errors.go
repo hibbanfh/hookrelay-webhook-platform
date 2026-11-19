@@ -21,9 +21,11 @@ type errorMapping struct {
 }
 
 // errorTable is the single place where message domain errors become HTTP responses. ErrNotFound
-// is deliberately absent: the only lookup is the replay of a key whose message must exist, so a
-// miss there is a server fault and becomes a generic 500.
+// is safe to map to 404 because PublishMessage turns a missing key or message during an
+// idempotent replay into ErrBrokenIdempotencyRecord, which is deliberately absent here and
+// stays a generic 500.
 var errorTable = []errorMapping{
+	{domainerrors.ErrNotFound, http.StatusNotFound, httpx.CodeNotFound, "message not found"},
 	{domainerrors.ErrIdempotencyMismatch, http.StatusUnprocessableEntity, httpx.CodeIdempotencyMismatch,
 		"Idempotency-Key was already used with a different request body"},
 }
