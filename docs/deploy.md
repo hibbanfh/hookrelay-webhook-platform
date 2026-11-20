@@ -113,8 +113,7 @@ that single token. From the next push to `main`, CI deploys the backend, then th
 ## 8. Verify
 
 ```sh
-curl -fsS https://hookrelay.fly.dev/healthz
-curl -fsS https://hookrelay.fly.dev/readyz            # 200 only when Postgres is reachable
+curl -fsS https://hookrelay.fly.dev/healthz            # 200 only when Postgres is reachable
 curl -fsS https://hookrelay-web.fly.dev/api/healthz   # {"status":"ok"}
 fly status -a hookrelay        # api and worker machines passing checks
 fly status -a hookrelay-web

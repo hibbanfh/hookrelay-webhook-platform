@@ -4,6 +4,24 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-20
+
+First release: all P0 stories (US-001 to US-008, US-010, US-025). Not deployed yet; first deploy steps are in `docs/deploy.md`.
+
+### Added (release prep)
+- Fly.io config for both apps: `backend/fly.toml` (API and worker process groups, `migrate up` as the release command) and `frontend/fly.toml` (dashboard and BFF).
+- `docs/deploy.md`: first-deploy guide (apps, Postgres, secrets, Neon Auth trusted origins, verify, rollback).
+- Gated CI deploys: the deploy jobs run on pushes to `main` only after backend, frontend and E2E pass, and only when the `FLY_API_TOKEN` secret exists; otherwise they skip and CI stays green.
+- `GET /api/healthz` on the dashboard.
+- `OUTBOUND_ALLOWLIST_ONLY=true` in the production Fly config, so only the built-in demo receiver can be registered as a destination.
+- Portfolio README, `docs/case-study.md` and screenshots in `docs/screenshots/`.
+
+### Changed (release prep)
+- CI GitHub Actions upgraded (`actions/checkout@v5`, `actions/setup-go@v6`, `actions/setup-node@v5`, `actions/upload-artifact@v5`, `golangci/golangci-lint-action@v9`).
+
+### Security (release prep)
+- Go raised from 1.26.10 to 1.26.11 for GO-2026-6859.
+
 ### Changed (breaking config)
 - `OUTBOUND_ALLOWLIST` is removed (US-010, ADR 0017). The SSRF allowlist is now derived: exactly `[DEMO_RECEIVER_BASE_URL]` when the demo receiver is enabled, empty otherwise. Setting `OUTBOUND_ALLOWLIST` to any non-empty value is a startup error, and so is `OUTBOUND_ALLOWLIST_ONLY=true` with the demo receiver disabled. Remove the variable from any deployment secrets before upgrading.
 

@@ -292,3 +292,30 @@ Bug found: BUG-QA-016 (minor, frontend-engineer): a failed background poll hides
 ## Bugs
 
 BUG-QA-001..016, see `docs/backlog.md` (section "Bugs (QA)").
+
+## Release v0.1.0 (HEAD 29087d4 plus the uncommitted `backend/go.mod` bump to Go 1.26.11)
+
+Run 2026-11-20 on Windows, `GOTOOLCHAIN=auto`, Go 1.26.11, Docker 29.9.2. Nothing was committed.
+
+| Suite | Command | Result |
+|---|---|---|
+| gofmt | `gofmt -l .` | PASS, no files listed |
+| vet | `go vet -tags integration ./...` | PASS |
+| golangci-lint | `golangci-lint run --timeout 10m` | PASS, 0 issues (the first run under load hit the default 1 m timeout, not a lint finding) |
+| layers | `sh scripts/check-layers.sh` | PASS, "layer rules: OK" |
+| govulncheck | `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` | PASS, no vulnerabilities (GO-2026-6859 fixed by 1.26.11) |
+| backend tests | `REQUIRE_DOCKER=1 go test -count=1 -tags integration -p 1 ./...` | PASS, 39 packages ok, 0 FAIL (neonauth did not hit "Access is denied") |
+| frontend | `npm run typecheck`, `lint`, `test`, `build` | PASS; vitest 25 files, 126 tests |
+| E2E with Neon | `E2E_NEON=1 npx playwright test` after `docker compose --env-file .env.local up -d --build` (containers recreated) | PASS, 18 passed, 1 skipped |
+| E2E as CI | `npx playwright test` | PASS, 4 passed, 15 skipped (gated specs) |
+
+Exploratory pass against the rebuilt stack (fresh project via `POST /v1/projects`):
+- API key returned once; `GET /v1/project` does not return it again. No key gives 401 with the error shape.
+- Empty endpoints and messages lists return `{"data":[],"next_cursor":null}`.
+- Demo endpoint plus `?fail_first=2` endpoint: publish with `Idempotency-Key` gave 202; repeat gave 202. Demo delivery succeeded on attempt 1; flaky delivery attempts returned 500, 500, 200 (`response_status`), status `succeeded`.
+- Replay of the flaky delivery: 202, attempt 4 `manual`, 200.
+- `/healthz` returns 200 `{"status":"ok","checks":{"database":"ok"}}`. `/readyz` does not exist (404), not a bug.
+- Sign-up, show-once key dialog and UI empty states are covered by the E2E run above.
+- `make test` was not run: it uses `go test -race`, and there is no gcc on this machine. `make lint` equals the backend and frontend lint steps above.
+
+Race run: `docker run golang:1.26-bookworm go test -race -count=1 ./...` (Go 1.26.11 linux/amd64, no integration tag): PASS, every package ok, no FAIL or data race output. No bug found in this release run (no BUG-QA-017).
