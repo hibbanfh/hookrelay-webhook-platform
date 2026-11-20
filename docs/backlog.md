@@ -421,7 +421,9 @@ Notes / out of scope:
 
 ---
 
-### US-008: Minimal dashboard            [status: todo]  [priority: P0]
+### US-008: Minimal dashboard            [status: done]  [priority: P0]
+
+> **Done 2026-11-20.** All 9 criteria PASS: vitest (126 tests) plus Playwright `e2e/dashboard.spec.ts` (`E2E_NEON=1`, real Neon Auth, compose stack with the demo receiver); the full E2E suite gave 18 passed, 1 skipped. BUG-QA-016 fixed. Review approved after two rounds (adaptive detail polling, 1-5 s; two E2E races removed). No API or backend change. Known limit: a real receiver near the 10 s delivery timeout can push a replayed attempt past the 10 s display target.
 As a platform developer, I want a simple web dashboard to manage endpoints and inspect
 deliveries, so that I can debug and replay webhooks without writing curl commands.
 
@@ -436,6 +438,9 @@ Acceptance criteria:
 - Given I'm on the Endpoints page, then I see each endpoint's URL, description, enabled
   state and created date. When I create an endpoint with an invalid URL, I see the API's
   validation message next to the URL field.
+- Given the create-endpoint form, when I click "Use demo receiver", then the URL field is filled
+  with `demo_receiver_url` from `GET /v1/project`, and the endpoint created from it receives
+  deliveries that succeed.
 - Given an endpoint, when I toggle enabled or disabled, then the change persists after a page
   reload. When I click "Reveal secret", then the signing secret is shown with a copy button.
 - Given I'm on the Messages page, then I see messages newest first with event type, time and
@@ -443,14 +448,18 @@ Acceptance criteria:
 - Given I open a message, then I see the pretty-printed payload, each delivery with its status,
   and, for each delivery, its attempts (number, time, status code or error, duration,
   response body snippet, trigger).
+- Given a message with no deliveries (`0/0/0` summary), then the list and the message page say
+  "No endpoints were enabled when this message was published" instead of an empty table.
 - Given a delivery that is `failed` or `succeeded`, when I click "Replay", then a new
   `manual` attempt appears within 10 seconds without a full page reload. For a `pending`
   delivery, the Replay button is disabled.
 - Given a project with no endpoints or no messages, then each page shows an empty state that
   explains the next step (for example a curl example for publishing).
-- Given the full stack is running, when the Playwright E2E test runs, then this flow passes:
-  sign in -> create endpoint -> publish through the API -> see the delivery `succeeded` ->
-  replay -> see a second attempt.
+- Given the full stack is running and `E2E_NEON=1` (skipped otherwise, like `e2e/auth.spec.ts`),
+  when the Playwright E2E test runs, then this flow passes: sign up (US-025) and read the API key
+  from the show-once dialog -> create an endpoint with "Use demo receiver" -> publish with that
+  key through `POST /v1/messages` -> see the delivery `succeeded` -> replay -> see a second
+  attempt with trigger `manual`.
 
 Notes / out of scope:
 - No project creation in the UI (user decision, 2026-11-08). In production, reviewers sign in
@@ -459,6 +468,14 @@ Notes / out of scope:
   reviewer demo path is an open question there.
 - No real-time push. Polling or refetching is fine. SSE is US-019 (P2).
 - Desktop layout only. Accessible basics (labels, keyboard focus) but no design polish.
+- PM defaults (2026-11-20):
+  - E2E API key: the test signs up a fresh Neon user and reads the key from the US-025 show-once
+    dialog. There is no seeded key and no test-only endpoint. It runs only with `E2E_NEON=1`.
+  - "Use demo receiver" is in scope (from US-010's notes), because the E2E test needs a
+    receiver that succeeds.
+  - "Send test message" button (architecture §18 Q5) is out of scope. The empty-state curl
+    example covers publishing. Could be a P2 story later.
+  - `0/0/0` messages (Q22) are explained in the UI. The API is unchanged.
 
 ---
 
@@ -649,3 +666,12 @@ multi-language SDKs. See `docs/PRD.md` section 5.
 - **Impact:** cosmetic. Both answers are 4xx and nothing is counted. Either move the range check ahead of `ReadBody` or reword the openapi order ("an integer, sent once; the range is checked after the body").
 - **Suspected area:** `internal/demoreceiver/delivery/presenter/http/receive_webhook_handler.go` or `api/openapi.yaml` `demoReceive`.
 - **Status: fixed.** The handler builds the plan with `entity.NewFailurePlan` before `httpx.ReadBody` and hands the validated plan to the use case, so a bad `fail_first` is a 400 before the 413 (an integer overflow gets the same range message). Pinned by `backend/wire/demoreceiver_qa_integration_test.go`, case "oversized with an out-of-range fail_first is a 400 first (BUG-QA-015)", and by handler tests.
+
+### BUG-QA-016: a failed background poll replaces the loaded table with an error (US-008)   [minor] - FIXED
+- **Steps:** open `/messages` or a message page that has a pending delivery (so it polls), then make one poll fail (500, 503 or a network drop; for example block `GET /api/v1/messages?*` in DevTools after the first load).
+- **Expected:** the already-loaded rows stay visible, with at most a small "could not refresh" note. **Actual:** `QueryState` checks `query.isError` before looking at data, and TanStack keeps `data` but sets `isError` on a failed refetch, so the whole table (or the message page, or the delivery's attempts) is swapped for the red alert + Retry until a refetch succeeds.
+- **Impact:** a one-off blip during the replay polling hides the attempt the user is waiting for. Recovers on Retry.
+- **Suspected area:** `frontend/src/components/query-state.tsx` (render error only when there is no data: `isError && data === undefined`, otherwise show children plus a non-blocking notice). Pinned by `frontend/src/components/query-state.test.tsx` as `test.fails`; change it to `test` when fixed.
+- **Owner:** frontend-engineer.
+- **Status: fixed.** `QueryState` shows the alert + Retry only when there is no data; with data and a failed refetch it keeps the content and adds a `role="status"` note "Couldn't refresh, retrying". The app shell's project error uses the same rule (`isError && !data`). Pinned by `query-state.test.tsx` (now a plain `test`, plus a no-data case).
+

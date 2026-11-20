@@ -3,8 +3,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { api, REPROVISION_EVENT } from "@/lib/api/client";
+import { PROJECT_KEY } from "@/lib/queries/keys";
 
-export const PROJECT_KEY = ["me", "project"] as const;
 
 export interface ProjectInfo {
   id: string;

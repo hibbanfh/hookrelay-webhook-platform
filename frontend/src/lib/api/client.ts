@@ -20,5 +20,10 @@ const sessionMiddleware: Middleware = {
   },
 };
 
-export const api = createClient<paths>({ baseUrl: "/api" });
+export const api = createClient<paths>({
+  // Same-origin BFF. Absolute in the browser (Request needs an absolute URL); never used during SSR.
+  baseUrl: typeof window === "undefined" ? "/api" : `${window.location.origin}/api`,
+  // Resolve fetch at call time (not import time) so tests can stub globalThis.fetch.
+  fetch: (request) => globalThis.fetch(request),
+});
 api.use(sessionMiddleware);

@@ -43,7 +43,7 @@ export default function AppLayout({ children }: { children: ReactNode }) {
         </div>
       </header>
       <div className="mx-auto max-w-5xl px-4 py-6">
-        {project.isError ? (
+        {project.isError && !project.data ? (
           <div role="alert" className="rounded-md bg-red-50 p-4 text-sm text-red-800">
             Could not load your project.{" "}
             <button type="button" onClick={() => void project.refetch()} className="font-medium underline">

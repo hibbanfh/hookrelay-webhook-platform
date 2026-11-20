@@ -86,6 +86,8 @@ services:
   web:
     build:
       context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
     image: hookrelay-web:local
     environment:
       API_INTERNAL_URL: http://api:8080

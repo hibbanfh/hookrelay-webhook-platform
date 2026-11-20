@@ -261,6 +261,34 @@ Gates: `REQUIRE_DOCKER=1 go test -tags integration -count=1 -p 1 ./wire/ ./inter
 
 Verdict: all 3 criteria and both story notes PASS. One new minor bug (BUG-QA-015). The story status is left for the caller.
 
+## US-008 (minimal dashboard)
+
+Run 2026-11-20 against `docker compose --env-file .env.local up -d --build` (web 3000, api 8080, worker, postgres), real Neon Auth, fresh user per run.
+
+Commands: `cd frontend && npm run typecheck && npm run lint && npm test && npm run build` (all clean; vitest 24 files, 121 tests, one of them `test.fails` for BUG-QA-016); `E2E_NEON=1 npx playwright test e2e/dashboard.spec.ts` (10/10 passed, 28 s); `cd backend && go test ./...` (all ok, no backend change).
+
+| # | Criterion | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Endpoints page: URL, description, enabled, created date; invalid URL -> API message next to the URL field | PASS | `endpoint-table.test.tsx`, `create-endpoint-form.test.tsx` (400 field=url: message under field, `aria-invalid`, focus); E2E 2 (`not-a-url`: `aria-invalid=true`, `#endpoint-url-error` not empty); E2E edge keyboard (Enter submits, focus returns to URL, `aria-describedby` set) |
+| 2 | "Use demo receiver" fills `demo_receiver_url`; endpoint created from it receives successful deliveries | PASS | form tests (exact URL, hidden when null); E2E 2 (field equals `GET /api/v1/project` value) and E2E 4 (delivery `succeeded`) |
+| 3 | Toggle persists after reload; "Reveal secret" shows secret + copy button | PASS | E2E 2: off -> reload -> off -> on -> reload -> on; `whsec_` value and "Copy secret"; `enabled-toggle.test.tsx`, `secret-reveal.test.tsx` |
+| 4 | Messages newest first with event type, time, delivery summary, "Load more" | PASS | `message-table`/`page.test.tsx`; E2E edge Load more: 22 messages -> 20 rows, click -> all rows, button gone |
+| 5 | Message page: pretty payload, deliveries with status, attempts (number, time, status/error, duration, body snippet, trigger) | PASS | `json-block.test.tsx`, `attempt-table.test.tsx` (including `<script>` as text); E2E 4 (`delivery-status` succeeded, `attempt-row` 1, `automatic`) |
+| 6 | `0/0/0`: list and message page say "No endpoints were enabled when this message was published" | PASS | `delivery-summary.test.tsx`; E2E edge 0/0/0 (endpoint disabled, publish: list row and detail page both show the sentence) |
+| 7 | Replay: new `manual` attempt within 10 s without reload; Replay disabled while `pending` | PASS | E2E 4 (button disabled right after click, attempt 2 `manual` within 10 s, no reload); `replay-button.test.tsx` (disabled + title when pending), `deliveries.test.tsx` (polling, fake timers) |
+| 8 | Empty states explain the next step (curl example) | PASS | E2E 2 ("No endpoints yet"), E2E 3 ("No messages yet"; curl checked: `curl -X POST http://localhost:8080/v1/messages`, `Authorization: Bearer $HOOKRELAY_API_KEY`, `Content-Type: application/json`, body `{event_type, payload:{...}}` valid per `PublishMessageRequest`; the body was POSTed to the API and got 202) |
+| 9 | E2E flow (sign up -> key -> demo receiver -> publish -> succeeded -> replay -> manual) | PASS | E2E 1, 2, 4 in the 10/10 run |
+
+Edge cases (all in `e2e/dashboard.spec.ts` unless noted):
+- Secret and API key in storage: `localStorage`/`sessionStorage` dump contains neither; "Hide" removes the secret from the DOM. Cache: `SecretReveal` uses a plain fetch into component state (code read) and `create-endpoint-form.test.tsx` asserts the create secret is not cached.
+- 500 and 503 on `/api/v1/messages`: "The service is unavailable. Try again." alert, the server's message text is not shown, Retry recovers.
+- Replay of a delivery whose endpoint is disabled: 409, "endpoint is disabled" shown beside the button.
+- Malformed (`not-an-id`, well-formed unknown, `%3Cscript%3E`) message ids: "Message not found" with a back link, no crash.
+- Labels: switch has accessible name `Enabled: <url>`, inputs have labels, focus moves to the first invalid field.
+- Not covered: the 10 s replay target with a slow real receiver (inherent, documented in the plan); `left-4.5` switch knob styling (visual only).
+
+Bug found: BUG-QA-016 (minor, frontend-engineer): a failed background poll hides already-loaded data behind the error alert.
+
 ## Bugs
 
-BUG-QA-001..015, see `docs/backlog.md` (section "Bugs (QA)").
+BUG-QA-001..016, see `docs/backlog.md` (section "Bugs (QA)").

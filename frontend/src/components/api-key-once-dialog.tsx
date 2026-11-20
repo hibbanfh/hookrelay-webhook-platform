@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
+import { CopyButton } from "@/components/copy-button";
 
 interface Props {
   apiKey: string;
@@ -10,21 +11,11 @@ interface Props {
 /** Shows the API key exactly once. The key lives in props/state only and is never persisted. */
 export function ApiKeyOnceDialog({ apiKey, onClose }: Props) {
   const ref = useRef<HTMLDialogElement>(null);
-  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
     const dialog = ref.current;
     if (dialog && !dialog.open) dialog.showModal?.();
   }, []);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(apiKey);
-      setCopied("copied");
-    } catch {
-      setCopied("failed");
-    }
-  }
 
   return (
     <dialog
@@ -48,17 +39,7 @@ export function ApiKeyOnceDialog({ apiKey, onClose }: Props) {
         {apiKey}
       </code>
       <div className="mt-4 flex flex-wrap items-center gap-3">
-        <button
-          type="button"
-          onClick={copy}
-          className="rounded-md border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
-        >
-          Copy key
-        </button>
-        <span role="status" className="text-sm text-slate-600">
-          {copied === "copied" && "Copied to clipboard"}
-          {copied === "failed" && "Copy failed. Select the key and copy it manually."}
-        </span>
+        <CopyButton value={apiKey} label="Copy key" />
         <button
           type="button"
           onClick={onClose}

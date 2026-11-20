@@ -1,18 +1,29 @@
 "use client";
 
-import { skipToken, useQuery } from "@tanstack/react-query";
-import { PROJECT_KEY, type ProjectInfo } from "@/lib/use-ensure-project";
+import { CreateEndpointForm } from "@/components/endpoints/create-endpoint-form";
+import { EndpointTable } from "@/components/endpoints/endpoint-table";
+import { LoadMoreButton } from "@/components/load-more-button";
+import { QueryState } from "@/components/query-state";
+import { flattenPages } from "@/lib/queries/pages";
+import { useEndpoints } from "@/lib/queries/endpoints";
 
-// Placeholder shell page: US-008 builds the endpoints list.
 export default function EndpointsPage() {
-  // Reads the project the shell already ensured (no second request).
-  const { data } = useQuery<ProjectInfo>({ queryKey: PROJECT_KEY, queryFn: skipToken });
+  const endpoints = useEndpoints();
+  const items = flattenPages(endpoints.data);
   return (
-    <section aria-labelledby="endpoints-title">
-      <h1 id="endpoints-title" className="text-2xl font-semibold tracking-tight">Endpoints</h1>
-      <p className="mt-2 text-slate-600">
-        Project: <strong>{data?.name}</strong>. Endpoint management arrives with US-008.
-      </p>
+    <section aria-labelledby="endpoints-title" className="space-y-6">
+      <h1 id="endpoints-title" className="text-2xl font-semibold tracking-tight">
+        Endpoints
+      </h1>
+      <CreateEndpointForm />
+      <QueryState query={endpoints} loadingLabel="Loading endpoints…">
+        <EndpointTable endpoints={items} />
+        <LoadMoreButton
+          hasNextPage={endpoints.hasNextPage}
+          isFetchingNextPage={endpoints.isFetchingNextPage}
+          fetchNextPage={endpoints.fetchNextPage}
+        />
+      </QueryState>
     </section>
   );
 }

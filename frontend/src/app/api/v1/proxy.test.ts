@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { GET, POST } from "./[...path]/route";
+import { GET, PATCH, POST } from "./[...path]/route";
 import { sealSession } from "@/lib/server/session-crypto";
 
 const ORIGIN = "http://localhost:3000";
@@ -124,4 +124,44 @@ test("a request body over 256 KB -> 413 and no upstream call", async () => {
   );
   expect(res.status).toBe(413);
   expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test("PATCH with the dashboard Origin is forwarded with its method and body", async () => {
+  fetchMock.mockResolvedValue(new Response('{"id":"ep_1","enabled":false}', { status: 200 }));
+  const res = await PATCH(
+    req("PATCH", "endpoints/ep_1", { origin: ORIGIN, cookie: await sessionCookie(), "content-type": "application/json" }, '{"enabled":false}'),
+    ctx("endpoints/ep_1"),
+  );
+  expect(res.status).toBe(200);
+  const [url, init] = fetchMock.mock.calls[0]!;
+  expect(url).toBe("http://api.test:8080/v1/endpoints/ep_1");
+  expect(init.method).toBe("PATCH");
+  expect(new TextDecoder().decode(init.body as ArrayBuffer)).toBe('{"enabled":false}');
+});
+
+test("PATCH with a foreign Origin -> 403 and no upstream call", async () => {
+  const res = await PATCH(
+    req("PATCH", "endpoints/ep_1", { origin: "http://evil.example", cookie: await sessionCookie() }, "{}"),
+    ctx("endpoints/ep_1"),
+  );
+  expect(res.status).toBe(403);
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+test("the query string is forwarded verbatim (cursor, limit, repeated params)", async () => {
+  fetchMock.mockImplementation(async () => new Response('{"data":[],"next_cursor":null}', { status: 200 }));
+  await GET(req("GET", "messages?cursor=abc%3D%3D&limit=20", { cookie: await sessionCookie() }), ctx("messages"));
+  await GET(req("GET", "endpoints/ep_1/deliveries?status=failed&status=pending", { cookie: await sessionCookie() }), ctx("endpoints/ep_1/deliveries"));
+  expect(fetchMock.mock.calls[0]![0]).toBe("http://api.test:8080/v1/messages?cursor=abc%3D%3D&limit=20");
+  expect(fetchMock.mock.calls[1]![0]).toBe("http://api.test:8080/v1/endpoints/ep_1/deliveries?status=failed&status=pending");
+});
+
+test("a POST with an empty body (replay) is forwarded", async () => {
+  fetchMock.mockResolvedValue(new Response('{"status":"pending"}', { status: 202 }));
+  const res = await POST(
+    req("POST", "deliveries/dlv_1/replay", { origin: ORIGIN, cookie: await sessionCookie() }),
+    ctx("deliveries/dlv_1/replay"),
+  );
+  expect(res.status).toBe(202);
+  expect(fetchMock.mock.calls[0]![0]).toBe("http://api.test:8080/v1/deliveries/dlv_1/replay");
 });

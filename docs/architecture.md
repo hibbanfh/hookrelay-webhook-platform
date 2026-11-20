@@ -1176,8 +1176,9 @@ URL under the project lock). Use case: `demoreceiver.ReceiveWebhook`; internal `
 `endpoint.EndpointURLLister`. Adapters: `demoSecretSource`, `demoSigner`. Migration `0006_demo_receiver_hits`. No worker change.
 
 ### US-008: Dashboard (frontend-engineer)
+Full plan (query keys, polling, components, error mapping, tests): [`docs/plans/us-008.md`](plans/us-008.md). No API or backend change.
 1. `npm run gen:api` (`openapi-typescript api/openapi.yaml -o src/lib/api/schema.d.ts`), plus an `openapi-fetch` client with `baseUrl: "/api"`.
-2. Pages: header with project name and sign-out; `/endpoints` (list, create form with field errors from `error.field`, "Use demo receiver" button filling `demo_receiver_url?fail_first=2`, enable toggle via PATCH, reveal secret + copy); `/messages` (list, delivery summary, "Load more" with `next_cursor`, empty state with a curl example); `/messages/[id]` (pretty payload, deliveries, attempts per delivery loaded on expand, Replay disabled when `pending`, `refetchInterval` 2 s while any delivery is pending).
+2. Pages: header with project name and sign-out; `/endpoints` (list, create form with field errors from `error.field`, "Use demo receiver" button filling `demo_receiver_url` verbatim so deliveries succeed (AC), enable toggle via PATCH, reveal secret + copy); `/messages` (list, delivery summary, "Load more" with `next_cursor`, empty state with a curl example); `/messages/[id]` (pretty payload, deliveries, attempts for every delivery fetched in parallel (≤ 20, bounded by the endpoint cap), Replay disabled when `pending`, `refetchInterval` 1 s while any delivery is pending, attempts invalidated when a delivery's status or `attempt_count` changes).
 3. Every view handles loading, empty, error and success states.
 4. Playwright: sign up (US-025; keep the key from the once-only dialog) → create endpoint (demo receiver) → publish via API → see `succeeded` → replay → see attempt #2 `manual`.
 
@@ -1199,6 +1200,7 @@ URL under the project lock). Use case: `demoreceiver.ReceiveWebhook`; internal `
 5. **Q5: "Send test message" button in the dashboard?** It would let reviewers publish without
    curl, which helps the 5-minute goal, at the cost of one extra UI action (it calls the existing
    `POST /v1/messages`, so there is no API change). Not in the US-008 AC today.
+   **Resolved (PM default): out of scope for US-008; the empty-state curl example stays.**
 6. **Q6: M0 scope overlap.** M0 implements `GET /v1/project` + auth (part of US-001) and
    dashboard sign-in (part of US-008) so the skeleton is a real slice. Confirm that this is fine
    and that those ACs get verified in M0 rather than re-done.
@@ -1243,6 +1245,7 @@ URL under the project lock). Use case: `demoreceiver.ReceiveWebhook`; internal `
 22. **Q22 (US-006): A message published while no endpoint was enabled shows `0/0/0`** and an empty `deliveries` array.
     Should the dashboard call this out ("no endpoints were enabled")? No API change needed either way.
     **Resolved (PM default, accepted as designed): `0/0/0` summary with an empty `deliveries` array.**
+    The dashboard says "no endpoints were enabled" (US-008 AC).
 23. **Q23 (US-006): Paging is not snapshot-stable.** A publish that commits late can land behind a cursor already handed
     out, so "Load more" can miss it until page 1 is refreshed (the dashboard already polls). Accept, or do we need
     commit-ordered paging (a sequence column + migration)?
