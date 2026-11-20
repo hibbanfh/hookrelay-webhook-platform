@@ -76,7 +76,9 @@ The dotted line is the built-in **demo receiver** (US-010). It lives in the API 
 
 One Go binary and one image (ADR 0002). On Fly.io, `fly.toml` defines `[processes]` for `api` and
 `worker`. The worker has no `http_service`, so it is never auto-stopped. Postgres is Fly Postgres
-or an external managed Postgres (open question Q3). The frontend's host is open question Q2.
+or an external managed Postgres such as Neon (open question Q3). The `web` process is a second Fly app,
+`hookrelay-web` (Q2, resolved), which reaches the API over Fly private networking (`api.process.hookrelay.internal`).
+First deploy steps: `docs/deploy.md`.
 
 Local: `docker compose` runs `postgres`, `migrate` (one-shot), `seed` (one-shot), `api`,
 `worker` and `web`. `make dev` brings it all up.
@@ -1184,12 +1186,12 @@ Full plan (query keys, polling, components, error mapping, tests): [`docs/plans/
 
 ## 18. Open questions for the PM
 
-1. **Q1: Lock the public demo to the demo receiver?** With a shared, documented key, anyone can
+1. **Q1 (resolved): Lock the public demo to the demo receiver?** Decision: yes, `OUTBOUND_ALLOWLIST_ONLY=true` in `backend/fly.toml`. With a shared, documented key, anyone can
    register arbitrary public URLs and use the demo as a POST relay. Recommendation: set
    `OUTBOUND_ALLOWLIST_ONLY=true` on the public deployment (a few lines, already designed). The
    trade-off is that reviewers can't point it at their own webhook.site URL. Alternatively, pull
    US-012 (rate limiting) into P0.
-2. **Q2: Where does the frontend run?** The BFF needs a Node server. Options: a second Fly app
+2. **Q2 (resolved): Where does the frontend run?** Decision: a second Fly app, `hookrelay-web` (`frontend/fly.toml`). The BFF needs a Node server. Options: a second Fly app
    (`hookrelay-web`, one platform) or Vercel (free, zero-config Next.js). Recommendation: Fly,
    for one platform and one bill, unless the free tier matters more.
 3. **Q3: Which Postgres?** Fly Postgres is unmanaged (you own backups and upgrades). Alternatives

@@ -1,11 +1,9 @@
 # Fly.io config for the Go backend (one image, two process groups: ADR 0002).
 # Lives in backend/ because the Docker build context is backend/. Deploy with:
 #   cd backend && fly deploy
-# One-time setup (secrets live only in Fly, never in this file):
-#   fly apps create hookrelay
-#   fly secrets set DATABASE_URL=... SECRET_ENCRYPTION_KEY=$(openssl rand -base64 32) SEED_DEMO_API_KEY=hr_...
-#   fly ssh console -C "/hookrelay seed"          # after the first deploy
-#   fly scale count api=1 worker=1
+# First deploy checklist: docs/deploy.md. Secrets live only in Fly, never in this file:
+#   DATABASE_URL, SECRET_ENCRYPTION_KEY, SEED_DEMO_API_KEY, NEON_AUTH_BASE_URL
+# `migrate up` (release_command) loads the full config, so ALL of them must be set before `fly deploy`.
 app = "hookrelay"
 primary_region = "iad"
 # SIGTERM, then SIGKILL after 30 s. WORKER_SHUTDOWN_TIMEOUT (25 s) must stay below this.
@@ -26,6 +24,11 @@ kill_timeout = 30
   WORKER_HEALTH_ADDR = ":9091"
   PUBLIC_BASE_URL = "https://hookrelay.fly.dev"
   LOG_LEVEL = "info"
+  # Required in production by loadConfig() (also for the release command). Must match the web app's URL.
+  DASHBOARD_ORIGIN = "https://hookrelay-web.fly.dev"
+  # Public demo lock (architecture Q1): only the built-in demo receiver may be registered.
+  DEMO_RECEIVER_ENABLED = "true"
+  OUTBOUND_ALLOWLIST_ONLY = "true"
 
 [processes]
   api = "/hookrelay api"

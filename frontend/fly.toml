@@ -1,0 +1,39 @@
+# Fly.io config for the Next.js dashboard + BFF. Build context is frontend/. Deploy with:
+#   cd frontend && fly deploy
+# First deploy checklist: docs/deploy.md. Secrets (set with `fly secrets set -a hookrelay-web`):
+#   SESSION_SECRET, NEON_AUTH_BASE_URL
+app = "hookrelay-web"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    # Inlined into the client bundle at build time (only used in the Messages empty-state curl example).
+    NEXT_PUBLIC_API_BASE_URL = "https://hookrelay.fly.dev"
+
+[env]
+  NODE_ENV = "production"
+  # Must be https:// in production and on Neon Auth's trusted origins.
+  DASHBOARD_ORIGIN = "https://hookrelay-web.fly.dev"
+  # Fly private network (6PN), api process group of the backend app, same org only. If the apps are in
+  # different orgs, use "https://hookrelay.fly.dev" instead.
+  API_INTERNAL_URL = "http://api.process.hookrelay.internal:8080"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "15s"
+    timeout = "3s"
+    method = "GET"
+    path = "/api/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

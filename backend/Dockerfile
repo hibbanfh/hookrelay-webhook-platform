@@ -2,7 +2,7 @@
 # One image, several processes (ADR 0002). No ENTRYPOINT on purpose: compose and Fly
 # pass the full command, e.g. "/hookrelay worker". Build context: ./backend
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.26.11-bookworm AS build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOFLAGS=-trimpath
 COPY go.mod go.sum ./
