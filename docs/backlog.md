@@ -377,7 +377,7 @@ Notes / out of scope:
 
 ---
 
-### US-007: Manually replay a delivery            [status: todo]  [priority: P0]
+### US-007: Manually replay a delivery            [status: done]  [priority: P0]
 As a platform developer, I want to replay a delivery on demand, so that I can recover a
 missed event after my customer fixes their server, without publishing it again.
 

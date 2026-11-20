@@ -318,10 +318,31 @@ export interface paths {
         put?: never;
         /**
          * Manually re-send a `failed` or `succeeded` delivery
-         * @description Moves the delivery back to `pending` with `trigger: manual`; the worker makes one attempt within seconds,
-         *     with the same `webhook-id` and body, a fresh `webhook-timestamp` and a recomputed signature, to the
-         *     endpoint's *current* URL and secret. A failed manual attempt is not retried automatically.
-         *     Returns `409 conflict` if the delivery is already `pending` or its endpoint is disabled. No request body.
+         * @description Moves the delivery back to `pending` for one **manual** attempt (ADR 0016). The worker makes that attempt
+         *     within seconds (it polls every 500 ms), with the same `webhook-id` (the message ID) and the same body
+         *     bytes, a fresh `webhook-timestamp` and a signature recomputed for it, to the endpoint's **current** URL
+         *     and secret. The attempt is listed with `trigger: manual` and the next `attempt_number`; earlier attempts
+         *     are never changed. If the manual attempt fails, the delivery becomes `failed` again and is **not**
+         *     retried automatically. A worker crash during the attempt does not count as a failure: the same manual
+         *     attempt is made again after the lease expires (about 30 s), with the same `attempt_number`.
+         *
+         *     **Order of checks:** a malformed path ID is `404`; then an unknown delivery or one of another project is
+         *     `404 not_found` ("delivery not found"); then a disabled endpoint is `409 conflict` ("endpoint is
+         *     disabled"); then a delivery that is `pending` (waiting for its first attempt or a scheduled retry, or
+         *     with an attempt in flight) is `409 conflict` ("delivery is already pending"). A `409` makes no attempt
+         *     and changes nothing.
+         *
+         *     **Concurrency:** the state change is one conditional update, so of two concurrent replays of the same
+         *     delivery exactly one gets `202` and the other `409` ("delivery is already pending"). At most one
+         *     attempt per delivery is ever queued or in flight.
+         *
+         *     **Not idempotent:** there is no `Idempotency-Key`. Retrying a replay request after the first replay has
+         *     already finished starts another manual attempt. Receivers deduplicate by `webhook-id`, so a receiver
+         *     that already processed this message may ignore the replay by design.
+         *
+         *     The endpoint's state is checked when the request arrives. If the endpoint is disabled after the `202`
+         *     but before the attempt, the attempt is recorded with `error: endpoint_disabled` (no request is sent) and
+         *     the delivery becomes `failed`. There is no request body; any body sent is ignored.
          */
         post: operations["replayDelivery"];
         delete?: never;
@@ -609,7 +630,7 @@ export interface components {
             deliveries: components["schemas"]["Delivery"][];
         };
         /**
-         * @description `pending`: waiting for its first attempt or a scheduled retry, or an attempt is in flight.
+         * @description `pending`: waiting for its first attempt, a scheduled retry or a requested replay, or an attempt is in flight.
          *     `succeeded`: an attempt got a `2xx`; no further attempts are made.
          *     `failed`: final. Retries are exhausted, the destination is blocked (`destination_blocked`), the endpoint
          *     is disabled (`endpoint_disabled`), or a manual replay failed. Only a replay starts it again.
@@ -625,8 +646,9 @@ export interface components {
             attempt_count: number;
             /**
              * Format: date-time
-             * @description When the next attempt is due: the first attempt, or a scheduled retry after a failed automatic
-             *     attempt (backoff with jitter). While an attempt is in flight it is the lease expiry instead.
+             * @description When the next attempt is due: the first attempt, a scheduled retry after a failed automatic
+             *     attempt (backoff with jitter), or the time a replay was requested. While an attempt is in flight it
+             *     is the lease expiry instead.
              *     `null` when not `pending`.
              */
             next_attempt_at: string | null;
@@ -768,7 +790,8 @@ export interface components {
             };
         };
         /**
-         * @description The request conflicts with current state (limit reached, delivery already pending, endpoint disabled), or
+         * @description The request conflicts with current state (for example the endpoint limit is reached; replay has its own
+         *     `ReplayConflict` with both replay messages), or
          *     `project_not_provisioned` when a verified session has no project yet.
          */
         Conflict: {
@@ -784,6 +807,18 @@ export interface components {
                  *       }
                  *     }
                  */
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description The replay was refused and nothing changed. The code is `conflict` in both replay cases; the message says
+         *     which one. A verified session without a project gets `project_not_provisioned` instead, as on every route.
+         */
+        ReplayConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
                 "application/json": components["schemas"]["Error"];
             };
         };
@@ -1439,18 +1474,50 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Replay queued. Returns the delivery in its new `pending` state. */
+            /**
+             * @description Replay queued. Returns the delivery in its new state: `status: pending`, `next_attempt_at` set to
+             *     the time of the request, `attempt_count` and `last_attempt_at` unchanged. Poll
+             *     `GET /v1/deliveries/{delivery_id}/attempts` to see the manual attempt.
+             */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "id": "dlv_01JC3ZM2H7Y9D4E6F8G0J1K2M3",
+                     *       "message_id": "msg_01JC3ZP4A5B6C7D8E9F0G1H2J3",
+                     *       "endpoint_id": "ep_01JC3ZM2H7Y9D4E6F8G0J1K2M3",
+                     *       "status": "pending",
+                     *       "attempt_count": 6,
+                     *       "next_attempt_at": "2026-11-19T10:15:00.123456Z",
+                     *       "last_attempt_at": "2026-11-19T09:12:41.004512Z",
+                     *       "created_at": "2026-11-19T07:54:02.511904Z"
+                     *     }
+                     */
                     "application/json": components["schemas"]["Delivery"];
                 };
             };
             401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            409: components["responses"]["Conflict"];
+            /** @description The delivery does not exist, belongs to another project, or the path ID is malformed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "error": {
+                     *         "code": "not_found",
+                     *         "message": "delivery not found"
+                     *       }
+                     *     }
+                     */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            409: components["responses"]["ReplayConflict"];
             500: components["responses"]["Internal"];
             503: components["responses"]["AuthUnavailable"];
         };

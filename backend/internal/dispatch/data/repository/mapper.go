@@ -3,6 +3,7 @@
 package repositoryimpl
 
 import (
+	"errors"
 	"time"
 
 	"hookrelay/internal/dispatch/data/model"
@@ -29,6 +30,21 @@ func toDeliveryUpdate(d entity.Delivery, leaseToken string, now time.Time) model
 		ID: d.ID, LeaseToken: leaseToken, Status: string(d.Status), AttemptCount: d.AttemptCount,
 		NextAttemptAt: utcPtr(d.NextAttemptAt), LastAttemptAt: utcPtr(d.LastAttemptAt), UpdatedAt: now.UTC(),
 	}
+}
+
+// errNotReplayed is a programming-error guard: Delivery.Replay always sets the due time, so this
+// is only reachable when a caller hands over a delivery that did not come from Replay.
+var errNotReplayed = errors.New("delivery has no next attempt time to replay at")
+
+// toReplayRequest takes the state Delivery.Replay produced. The due time doubles as updated_at.
+func toReplayRequest(d entity.Delivery) (model.ReplayRequest, error) {
+	if d.NextAttemptAt == nil {
+		return model.ReplayRequest{}, errNotReplayed
+	}
+	return model.ReplayRequest{
+		ID: d.ID, ProjectID: d.ProjectID, Status: string(d.Status), Trigger: string(d.Trigger),
+		NextAttemptAt: d.NextAttemptAt.UTC(),
+	}, nil
 }
 
 func utcPtr(t *time.Time) *time.Time {

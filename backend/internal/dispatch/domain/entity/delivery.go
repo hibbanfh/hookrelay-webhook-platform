@@ -1,6 +1,10 @@
 package entity
 
-import "time"
+import (
+	"time"
+
+	domainerrors "hookrelay/internal/dispatch/domain/errors"
+)
 
 // Delivery is one message bound for one endpoint: the unit of work of the queue.
 type Delivery struct {
@@ -19,6 +23,24 @@ type Delivery struct {
 
 // NextAttemptNumber is the number the attempt being made will get.
 func (d Delivery) NextAttemptNumber() int { return d.AttemptCount + 1 }
+
+// IsTerminal reports whether the delivery has finished: no attempt is queued or in flight.
+func (d Delivery) IsTerminal() bool { return d.Status == StatusSucceeded || d.Status == StatusFailed }
+
+// Replay returns the delivery queued for one manual attempt at now. Only a finished delivery can
+// be replayed: a pending one already has an attempt coming. The counts and the last attempt time
+// are kept, so the manual attempt is numbered after the earlier ones, and the manual trigger
+// makes ApplyOutcome skip the retry planner.
+func (d Delivery) Replay(now time.Time) (Delivery, error) {
+	if !d.IsTerminal() {
+		return Delivery{}, domainerrors.ErrDeliveryPending
+	}
+	d.Status = StatusPending
+	d.Trigger = TriggerManual
+	d.NextAttemptAt = &now
+	d.Lease = Lease{}
+	return d, nil
+}
 
 // ApplyOutcome is the one place the state rules live. It returns the delivery after the attempt
 // and the attempt record. The planner is asked only for an automatic attempt that failed in a

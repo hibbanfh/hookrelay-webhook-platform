@@ -166,7 +166,11 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 	attemptPersistentImpl := ProvideAttemptSource(pool)
 	attemptReader := repositoryimpl4.NewAttemptReader(attemptPersistentImpl)
 	listDeliveryAttempts := usecase4.NewListDeliveryAttempts(repositoryDeliveryReader, attemptReader)
-	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, responder)
+	deliveryReplayPersistentImpl := ProvideDeliveryReplaySource(pool)
+	deliveryReplayer := repositoryimpl4.NewDeliveryReplayer(deliveryReplayPersistentImpl)
+	clock4 := ProvideDispatchClock(system)
+	replayDelivery := usecase4.NewReplayDelivery(repositoryDeliveryReader, repositoryEndpointStateReader, deliveryReplayer, clock4)
+	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, replayDelivery, responder)
 	dispatchRoutes := DispatchRoutes{
 		Handler: handler3,
 		Guard:   projectGuard,
@@ -316,7 +320,11 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 	attemptPersistentImpl := ProvideAttemptSource(pool)
 	attemptReader := repositoryimpl4.NewAttemptReader(attemptPersistentImpl)
 	listDeliveryAttempts := usecase4.NewListDeliveryAttempts(repositoryDeliveryReader, attemptReader)
-	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, responder)
+	deliveryReplayPersistentImpl := ProvideDeliveryReplaySource(pool)
+	deliveryReplayer := repositoryimpl4.NewDeliveryReplayer(deliveryReplayPersistentImpl)
+	clock4 := ProvideDispatchClock(system)
+	replayDelivery := usecase4.NewReplayDelivery(repositoryDeliveryReader, repositoryEndpointStateReader, deliveryReplayer, clock4)
+	handler3 := ProvideDispatchHandler(listEndpointDeliveries, listDeliveryAttempts, replayDelivery, responder)
 	dispatchRoutes := DispatchRoutes{
 		Handler: handler3,
 		Guard:   projectGuard,
@@ -547,7 +555,7 @@ var infra = wire.NewSet(logger.ProviderSet, LoggerOptions, postgres.ProviderSet,
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchReadSet, httpclient.ProviderSet, HTTPClientOptions,
+	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchAPISet, httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger, wire.Struct(new(RouterDeps), "*"), NewRouter,
 )
 

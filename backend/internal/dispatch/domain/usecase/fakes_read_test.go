@@ -54,14 +54,31 @@ func (f *fakeAttemptReader) ListByDelivery(_ context.Context, q repository.Attem
 	return f.rows, f.err
 }
 
+// fakeEndpointState answers enabled unless disabled is set.
 type fakeEndpointState struct {
-	err   error
-	calls int
+	disabled    bool
+	err         error
+	calls       int
+	gotProject  string
+	gotEndpoint string
 }
 
-func (f *fakeEndpointState) GetState(context.Context, string, string) (entity.EndpointState, error) {
+func (f *fakeEndpointState) GetState(_ context.Context, projectID, endpointID string) (entity.EndpointState, error) {
 	f.calls++
-	return entity.EndpointState{Enabled: true}, f.err
+	f.gotProject, f.gotEndpoint = projectID, endpointID
+	return entity.EndpointState{Enabled: !f.disabled}, f.err
+}
+
+// fakeReplayer records the requeued deliveries and answers with stored, or err.
+type fakeReplayer struct {
+	stored entity.Delivery
+	err    error
+	got    []entity.Delivery
+}
+
+func (f *fakeReplayer) Requeue(_ context.Context, d entity.Delivery) (entity.Delivery, error) {
+	f.got = append(f.got, d)
+	return f.stored, f.err
 }
 
 func deliveriesAt(n int) []entity.Delivery {

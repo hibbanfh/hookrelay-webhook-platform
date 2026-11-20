@@ -73,12 +73,16 @@ func rejectAll(http.Handler) http.Handler {
 }
 
 func serve(d *fakeEndpointDeliveries, a *fakeAttempts, guard func(http.Handler) http.Handler, path string) *httptest.ResponseRecorder {
-	h := httppresenter.NewHandler(httppresenter.UseCases{EndpointDeliveries: d, Attempts: a},
-		httpx.NewResponder(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	return serveWith(http.MethodGet, httppresenter.UseCases{EndpointDeliveries: d, Attempts: a}, guard, path)
+}
+
+// serveWith sends one request with the given method through the real routes and handler.
+func serveWith(method string, uc httppresenter.UseCases, guard func(http.Handler) http.Handler, path string) *httptest.ResponseRecorder {
+	h := httppresenter.NewHandler(uc, httpx.NewResponder(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	mux := http.NewServeMux()
 	httppresenter.Routes(mux, h, guard)
 	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	mux.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
 	return rec
 }
 

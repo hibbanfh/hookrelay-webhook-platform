@@ -120,22 +120,27 @@ func ProvideDispatchTx(m *postgres.TxManager) dispatchuc.TxManager { return m }
 // ProvideDispatchJitter binds the uniform random source to the dispatch JitterSource port.
 func ProvideDispatchJitter(u random.Uniform) dispatchentity.JitterSource { return u }
 
-// DispatchReadSet builds the read side of the dispatch module for the API process: the two
-// routes below /v1 and the two internal use cases the message module reads through an adapter
-// (ADR 0015). It has no sender and no worker, so a request path cannot make an outbound call
-// (ADR 0002). It needs GetEndpoint from EndpointSet for the ownership check.
-var DispatchReadSet = wire.NewSet(
-	ProvideDeliveryReadSource, ProvideAttemptSource,
+// DispatchAPISet builds the API side of the dispatch module: the read routes, the replay write
+// and the two internal reads the message module goes through an adapter (ADR 0015, ADR 0016). It
+// has no sender, no worker and no queue, so a request path cannot make an outbound call (ADR
+// 0002). It needs GetEndpoint from EndpointSet for the ownership and enabled checks. It shares
+// ProvideDispatchClock with DispatchSet; the two sets are never in the same injector.
+var DispatchAPISet = wire.NewSet(
+	ProvideDeliveryReadSource, ProvideAttemptSource, ProvideDeliveryReplaySource,
 	wire.Bind(new(dispatchsource.DeliveryReadPersistent), new(*dispatchsource.DeliveryReadPersistentImpl)),
 	wire.Bind(new(dispatchsource.AttemptListPersistent), new(*dispatchsource.AttemptPersistentImpl)),
+	wire.Bind(new(dispatchsource.DeliveryReplayPersistent), new(*dispatchsource.DeliveryReplayPersistentImpl)),
 	repositoryimpl.NewDeliveryReader,
 	repositoryimpl.NewAttemptReader,
+	repositoryimpl.NewDeliveryReplayer,
 	ProvideEndpointStateReader,
+	ProvideDispatchClock,
 
 	dispatchuc.NewListEndpointDeliveries,
 	dispatchuc.NewListDeliveryAttempts,
 	dispatchuc.NewSummarizeDeliveries,
 	dispatchuc.NewListMessageDeliveries,
+	dispatchuc.NewReplayDelivery,
 
 	ProvideDispatchHandler,
 	wire.Struct(new(DispatchRoutes), "*"),
@@ -158,9 +163,16 @@ func ProvideDeliveryReadSource(pool *pgxpool.Pool) *dispatchsource.DeliveryReadP
 	return dispatchsource.NewDeliveryReadPersistent(pool)
 }
 
-// ProvideDispatchHandler builds the HTTP handler from the two route use cases.
+// ProvideDeliveryReplaySource hands the pool to the replay source as the Querier it needs.
+func ProvideDeliveryReplaySource(pool *pgxpool.Pool) *dispatchsource.DeliveryReplayPersistentImpl {
+	return dispatchsource.NewDeliveryReplayPersistent(pool)
+}
+
+// ProvideDispatchHandler builds the HTTP handler from the three route use cases.
 func ProvideDispatchHandler(
-	deliveries *dispatchuc.ListEndpointDeliveries, attempts *dispatchuc.ListDeliveryAttempts, resp httpx.Responder,
+	deliveries *dispatchuc.ListEndpointDeliveries, attempts *dispatchuc.ListDeliveryAttempts,
+	replay *dispatchuc.ReplayDelivery, resp httpx.Responder,
 ) *dispatchhttp.Handler {
-	return dispatchhttp.NewHandler(dispatchhttp.UseCases{EndpointDeliveries: deliveries, Attempts: attempts}, resp)
+	return dispatchhttp.NewHandler(
+		dispatchhttp.UseCases{EndpointDeliveries: deliveries, Attempts: attempts, Replay: replay}, resp)
 }

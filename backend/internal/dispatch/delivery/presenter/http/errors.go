@@ -22,10 +22,13 @@ type errorMapping struct {
 
 // errorTable is the single place where dispatch domain errors become HTTP responses. Both not
 // found errors are 404 with the same code; the message says which resource was missing. A
-// foreign ID is reported exactly like an unknown one.
+// foreign ID is reported exactly like an unknown one. The two replay refusals are 409 with the same
+// code and their own message; the bare ErrConflict is left out so a new conflict must pick one.
 var errorTable = []errorMapping{
 	{domainerrors.ErrDeliveryNotFound, http.StatusNotFound, httpx.CodeNotFound, "delivery not found"},
 	{domainerrors.ErrEndpointNotFound, http.StatusNotFound, httpx.CodeNotFound, "endpoint not found"},
+	{domainerrors.ErrEndpointDisabled, http.StatusConflict, httpx.CodeConflict, "endpoint is disabled"},
+	{domainerrors.ErrDeliveryPending, http.StatusConflict, httpx.CodeConflict, "delivery is already pending"},
 }
 
 // toAPIError converts a domain error to *httpx.Error. Unknown errors are returned unchanged so

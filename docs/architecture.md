@@ -320,11 +320,11 @@ Full plan: [`docs/plans/us-003.md`](plans/us-003.md). Decisions: ADR 0013.
 ### 5.4 `dispatch`: deliveries, attempts, worker
 
 Full plan for US-004: [`docs/plans/us-004.md`](plans/us-004.md). Decisions: ADR 0014 (polling, claim and lease,
-fenced completion, catalog adapters, shutdown).
+fenced completion, catalog adapters, shutdown). Replay (US-007): ADR 0016, plan [`docs/plans/us-007.md`](plans/us-007.md).
 
 | Kind | Name | Notes |
 |---|---|---|
-| Entity | `Delivery{ID, ProjectID, MessageID, EndpointID, Status, Trigger, AttemptCount, NextAttemptAt, LastAttemptAt, Lease}` | State machine in §8.3. `ApplyOutcome(result, RetryPlanner, now) (Delivery, Attempt)` is the single place the rules live. US-007 adds `Replay(now)` |
+| Entity | `Delivery{ID, ProjectID, MessageID, EndpointID, Status, Trigger, AttemptCount, NextAttemptAt, LastAttemptAt, Lease}` | State machine in §8.3. `ApplyOutcome(result, RetryPlanner, now) (Delivery, Attempt)` is the single place the rules live. US-007 adds `Replay(now) (Delivery, error)`: `pending` → `ErrDeliveryPending`; otherwise `pending` + `manual` + `next_attempt_at = now`, counts untouched (ADR 0016) |
 | Entity | `Attempt{ID, ProjectID, DeliveryID, Number, Trigger, StartedAt, Duration, StatusCode, Body ResponseBody, Err}` | `Number = attempt_count + 1` at claim time |
 | Value | `Status` (`pending`/`succeeded`/`failed`), `Trigger` (`automatic`/`manual`), `AttemptError` (`timeout`, `connection_error`, `dns_error`, `destination_blocked`, `endpoint_disabled`; the last two are terminal), `Lease{Token, ExpiresAt}` | typed constants |
 | Value | `Outcome{StatusCode, Body, Err}`, `ResponseBody{Text, Truncated}` | `NewResponseBody` keeps at most 4096 bytes of valid UTF-8 without NUL |
@@ -332,8 +332,9 @@ fenced completion, catalog adapters, shutdown).
 | Strategy | `RetryPlanner{Next(attemptNumber, now) (time.Time, bool)}` | `BackoffSchedule` (US-005, §8.3) in production; `NoRetry` in tests |
 | Port (entity) | `JitterSource{Float64() float64}` | uniform sample in [0, 1) for `BackoffSchedule`. Declared in `entity`, not `usecase`, because its consumer is an entity; `library/random.Uniform` satisfies it (US-005) |
 | Func | `Sign(key []byte, msgID string, ts int64, body []byte) string` | Standard Webhooks `v1,` + base64 HMAC-SHA256 (ADR 0007) |
-| Errors | `ErrLeaseLost`, `ErrSendAborted` (US-004); `ErrNotFound`, `ErrDeliveryPending` (409), `ErrEndpointDisabled` (409), `ErrConflict` (US-006/007) | |
-| Port | `DeliveryQueue{ClaimDue(ctx, now, limit, lease), Complete(ctx, delivery, leaseToken)}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that. US-007 adds `RequeueForReplay` |
+| Errors | `ErrLeaseLost`, `ErrSendAborted` (US-004); `ErrNotFound` (+ `ErrDeliveryNotFound`, `ErrEndpointNotFound`, US-006); `ErrConflict` with `ErrDeliveryPending` and `ErrEndpointDisabled` wrapping it (409, US-007) | |
+| Port | `DeliveryQueue{ClaimDue(ctx, now, limit, lease), Complete(ctx, delivery, leaseToken)}` | queue operations (§8.2). `message` creates the rows as `pending` at publish (ADR 0013), and `dispatch` owns every change after that. Worker graph only |
+| Port | `DeliveryReplayer{Requeue(ctx, entity.Delivery) (entity.Delivery, error)}` | US-007, API graph only. One conditional `UPDATE ... WHERE status IN ('succeeded','failed')`; 0 rows → `ErrDeliveryPending` (ADR 0016) |
 | Port | `AttemptRepository{Create}` | append-only, worker only |
 | Port | `DeliveryReader{Get, ListByEndpoint, ListByMessage, CountByMessages}`, `AttemptReader{ListByDelivery}` | US-006 project-scoped reads, API graph only (plan: [`docs/plans/us-006.md`](plans/us-006.md)) |
 | Port (outbound) | `Sender{Send(ctx, SignedRequest) (Outcome, error)}` | `data/webhookhttp`: netguard-guarded client. Network failures are outcomes; the only error is `ErrSendAborted` |
@@ -343,7 +344,7 @@ fenced completion, catalog adapters, shutdown).
 | Ports (usecase) | `Clock`, `IDGenerator`, `TxManager` (US-004) | |
 | Use case | `ClaimDueDeliveries` | internal (worker). `ClaimDue` + 2 batch catalog lookups → `{Jobs, Skipped}` (3 queries per batch) |
 | Use case | `AttemptDelivery` | internal (worker). One job: disabled check → sign → send → `ApplyOutcome` → tx{fenced `Complete`, `Attempts.Create`} |
-| Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` (US-007) |
+| Use case | `ReplayDelivery` | `POST /v1/deliveries/{id}/replay` (US-007). `Get` (404) → `GetState` (disabled → 409) → `Replay(now)` (pending → 409) → `Requeue` (lost race → 409). 3 queries, no transaction (§8.4) |
 | Use case | `ListDeliveryAttempts` | `GET /v1/deliveries/{id}/attempts` (US-006) |
 | Use case | `ListEndpointDeliveries` | `GET /v1/endpoints/{id}/deliveries`. Ownership via `EndpointStateReader.GetState` → 404 (US-006) |
 | Use case | `SummarizeDeliveries` | internal, for `message.DeliveryReader` (US-006) |
@@ -478,7 +479,7 @@ CREATE TABLE deliveries (
   message_id       text NOT NULL,
   endpoint_id      text NOT NULL,
   status           text NOT NULL CHECK (status IN ('pending','succeeded','failed')),
-  trigger          text NOT NULL DEFAULT 'automatic' CHECK (trigger IN ('automatic','manual')),
+  trigger          text NOT NULL DEFAULT 'automatic' CHECK (trigger IN ('automatic','manual')),  -- of the current/next attempt; replay sets 'manual', never reset (ADR 0016)
   attempt_count    integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
   next_attempt_at  timestamptz,                     -- due time, or lease expiry while in flight
   lease_token      text,                            -- set by claim; fencing token for completion
@@ -792,19 +793,57 @@ with gaps ≥ 0.9 s and ≥ 1.8 s. Retry state lives only in the row (`next_atte
 
 ### 8.4 Replay (US-007)
 
-`ReplayDelivery`: `Reader.Get(projectID, id)` (404 if missing or foreign) →
-`d.Replay(now)` (`ErrDeliveryPending` → 409) → `EndpointStateReader.GetState` (`!enabled` →
-`ErrEndpointDisabled` → 409 "endpoint is disabled") → `Repository.RequeueForReplay`:
+Decisions: ADR 0016. Plan: [`docs/plans/us-007.md`](plans/us-007.md).
 
-```sql
-UPDATE deliveries SET status = 'pending', trigger = 'manual', next_attempt_at = @now, updated_at = @now
-WHERE id = @id AND project_id = @project_id AND status IN ('succeeded','failed')
-RETURNING ...;          -- 0 rows → a concurrent replay won → ErrConflict (409)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as dispatch handler
+    participant U as ReplayDelivery
+    participant E as EndpointStateReader (endpoint.GetEndpoint)
+    participant DB as Postgres (deliveries)
+    participant W as worker (unchanged)
+    C->>H: POST /v1/deliveries/{id}/replay
+    H->>H: IsDeliveryID? else 404
+    H->>U: Execute(projectID, deliveryID)
+    U->>DB: DeliveryReader.Get (project-scoped), 404 if missing or foreign
+    U->>E: GetState(projectID, endpointID), disabled → 409 "endpoint is disabled"
+    U->>U: d.Replay(now), pending → 409 "delivery is already pending"
+    U->>DB: DeliveryReplayer.Requeue: conditional UPDATE ... RETURNING
+    alt 1 row
+        H-->>C: 202 Delivery (pending, next_attempt_at = now)
+    else 0 rows (a concurrent replay won)
+        H-->>C: 409 "delivery is already pending"
+    end
+    W->>DB: next poll (≤ 0.5 s): claim returns trigger = manual
+    W->>W: sign (same webhook-id + body, fresh ts), send, ApplyOutcome (manual: no retry)
 ```
 
-The conditional update is the concurrency guard (a double-click gives one `202` and one `409`).
-History is untouched, and the next attempt number is `attempt_count + 1`. The worker picks the
-row up on its next poll (≤ 0.5 s), well within the 5 s AC.
+```sql
+UPDATE deliveries
+SET status = 'pending', trigger = 'manual', next_attempt_at = @now, updated_at = @now   -- values from Delivery.Replay
+WHERE id = @id AND project_id = @project_id AND status IN ('succeeded','failed')
+RETURNING id, project_id, message_id, endpoint_id, status, trigger, attempt_count,
+          next_attempt_at, last_attempt_at, created_at;   -- 0 rows → ErrDeliveryPending (409)
+```
+
+- **Order of checks:** malformed ID → 404; missing or foreign → 404; endpoint disabled → 409; not terminal → 409.
+- **Concurrency:** the conditional update is a compare-and-set. A second concurrent replay waits on the row lock,
+  re-checks the `WHERE` on the new version (`READ COMMITTED`), matches 0 rows and gets 409, so a double-click is one
+  `202` and one `409`. The claim only touches `pending` rows and replay only terminal ones, so they never race.
+- **Lease and fencing (ADR 0014):** terminal rows always have `lease_token IS NULL` (table `CHECK`). A stale worker
+  that lost its lease before the row was completed and replayed fails its fenced completion and records nothing.
+- **Counts:** `attempt_count` and `last_attempt_at` are untouched, so the manual attempt is `attempt_count + 1`. History
+  is append-only. A crashed manual attempt is reclaimed after the lease with the same number, still `manual`.
+- **Worker:** no change. The claim already returns `trigger`, `ApplyOutcome` already makes any manual failure final,
+  and the target (URL, secret, `enabled`) is read after every claim, so the replay uses the endpoint's current state.
+- **Endpoint disabled after the check (TOCTOU):** accepted. The API check is for a clear `409`; the worker is the
+  authority and records `endpoint_disabled` without sending (ADR 0016 §3).
+- **Not idempotent:** no `Idempotency-Key`. At most one attempt per delivery is queued or in flight, so repeated
+  requests cannot fan out sends.
+- **Latency:** due at once, claimed on the next poll (≤ 0.5 s), well within the 5 s AC, unless a backlog of older
+  due rows is ahead of it (FIFO claim).
 
 ### 8.5 Demo receiver (US-010)
 
@@ -838,7 +877,9 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 | Two workers, one row | `FOR UPDATE SKIP LOCKED` claim plus a lease in `next_attempt_at` |
 | Worker crash | Lease expiry → row is due again. No in-memory state |
 | Stale worker after lease expiry | `lease_token` fencing on completion |
-| Double replay | Conditional `UPDATE ... WHERE status IN ('succeeded','failed')` |
+| Double replay | Conditional `UPDATE ... WHERE status IN ('succeeded','failed')`, one autocommit statement (ADR 0016) |
+| Replay vs. worker | Disjoint predicates: claim needs `pending`, replay needs terminal. Terminal rows hold no lease, so fencing is unaffected |
+| Replay vs. endpoint disable | Checked before the update, not atomically; the worker re-reads `enabled` after the claim and records `endpoint_disabled` (ADR 0016) |
 | Duplicate HTTP sends | Accepted (at-least-once). Stable `webhook-id` = message ID |
 | Read-your-writes in dashboard | Single primary. Reads go to the same DB |
 
@@ -870,7 +911,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
   scale, partition `attempts` and `messages` by month and drop partitions instead of deleting.
 - **N+1 avoided:** message list = 2 queries (page + `GROUP BY` counts). Worker batch = 3 queries
   (claim + targets + payloads). Message detail, endpoint deliveries and attempts = 2 queries each
-  (ADR 0015). Auth = 1 indexed lookup per request.
+  (ADR 0015). Replay = 3 (delivery, endpoint state, conditional update; ADR 0016). Auth = 1 indexed lookup per request.
   A session request costs 1 Neon call per token per 5 s (cached, `singleflight`) plus 1 indexed
   lookup on `projects.neon_user_id`.
 - **Pools:** API `pgxpool` max 10, worker max 6. `statement_timeout = 5s` and
@@ -891,7 +932,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 | **Information disclosure**: secrets at rest | Keys hashed, signing secrets AES-256-GCM encrypted. Secret only in `POST /v1/endpoints` and `GET .../secret` (`Cache-Control: no-store`) |
 | **Information disclosure**: errors and logs | `500` bodies are generic. Logs never contain `Authorization`, API keys, secrets or payloads. `SigningSecret` redacts itself |
 | **Elevation**: SSRF | netguard at registration and dial time, no redirects, no proxy, explicit allowlist (ADR 0003) |
-| **DoS** | 256 KB body limit, server timeouts (`ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s, `WriteTimeout` 20 s, `IdleTimeout` 120 s), per-request 10 s context, 20 endpoints per project, 4 KB stored response bodies, DB statement timeout. Rate limiting is P1 (US-012) |
+| **DoS** | 256 KB body limit, server timeouts (`ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s, `WriteTimeout` 20 s, `IdleTimeout` 120 s), per-request 10 s context, 20 endpoints per project, 4 KB stored response bodies, DB statement timeout. Replay allows at most one queued or in-flight attempt per delivery (409 otherwise). Rate limiting is P1 (US-012) |
 | **Abuse of the public demo** (shared, documented key) | Project creation off in production. Endpoint limit. Optionally `OUTBOUND_ALLOWLIST_ONLY=true` (demo receiver only; see Q1). Periodic demo reset (Q4) |
 | **Spoofing** a dashboard user | Neon Auth owns passwords and sessions. Go checks every session with Neon itself and does not trust a header from the BFF. The cache holds positive results only, for ≤ 5 s. Errors fail closed (`503`). There is one identical `401`, and requests without a credential never reach Neon (ADR 0011) |
 | **Dashboard XSS / CSRF** | The Neon session lives only in the BFF's encrypted httpOnly `SameSite=Lax` cookie. The browser never talks to Neon, and the API key is shown once from a `no-store` response and kept in React state only. The BFF checks `Origin` on every non-GET request and drops browser-supplied credential headers. The API has no cookies and no CORS (ADR 0011). Payloads and response bodies are rendered as text, never HTML |
@@ -1073,11 +1114,11 @@ attempt-number cursor, per-statement consistency). Use cases: `message.ListMessa
 `DispatchReadSet` (API graph only). **No migration**: every query is served by indexes from 0004/0005.
 
 ### US-007: Replay
-1. `dispatch/domain/delivery.go`: `Replay(now)` → `ErrDeliveryPending`. `ApplyOutcome`: manual means no retries. `repository.go`: `RequeueForReplay`.
-2. `dispatch/usecase/replay_delivery.go`. Tests cover pending → 409, disabled endpoint → 409, foreign → 404, concurrent loss → 409, success.
-3. `dispatch/data/postgres`: conditional update query. Integration test: two concurrent replays → one wins.
-4. HTTP: `POST /v1/deliveries/{id}/replay` → `202` + delivery. Errors table: `ErrDeliveryPending` and `ErrEndpointDisabled` → 409.
-5. System test: replay carries the same `webhook-id` and body, a new timestamp, a valid signature, and `trigger: manual`.
+Full layer-ordered plan, SQL, wiring allowlist and AC → test map: [`docs/plans/us-007.md`](plans/us-007.md).
+Decisions: ADR 0016 (reuse `deliveries.trigger`, conditional requeue from the API, worker is the authority on
+`enabled`, separate `DeliveryReplayer` port). Use case: `dispatch.ReplayDelivery`. Ports: `DeliveryReplayer` (new),
+`DeliveryReader`, `EndpointStateReader` (reused), `Clock`. Entity: `Delivery.Replay`. **No migration, no worker change.**
+Wire: `DispatchReadSet` renamed `DispatchAPISet`; rule 5f allowlist gains the new providers.
 
 ### US-010: Demo receiver (now P0)
 1. `demoreceiver/domain`: `plan.go` (`FailurePlan`), `verify.go` (`Verify`), `errors.go`, `repository.go` (`HitCounter`), `ports.go` (`SecretSource`).
@@ -1160,3 +1201,20 @@ attempt-number cursor, per-statement consistency). Use cases: `message.ListMessa
     out, so "Load more" can miss it until page 1 is refreshed (the dashboard already polls). Accept, or do we need
     commit-ordered paging (a sequence column + migration)?
     **Resolved (PM default, accepted as designed): non-snapshot paging accepted; no migration.**
+24. **Q24 (US-007): Replay is not idempotent.** A client that retries `POST .../replay` after the first replay already
+    finished starts another manual attempt (never more than one queued or in flight). Recommended default: accept;
+    receivers dedupe by `webhook-id`, and the dashboard disables the button while `pending`.
+    **Resolved (PM default, accepted as designed): not idempotent; at most one attempt queued or in flight.**
+25. **Q25 (US-007): Both replay refusals use code `conflict`**, told apart only by the message ("endpoint is disabled",
+    "delivery is already pending"), as the AC words it. Recommended default: keep `conflict`; add distinct codes only if a
+    client needs to branch on them.
+    **Resolved (PM default, accepted as designed): both refusals use `conflict`, told apart by message.**
+26. **Q26 (US-007): When the delivery is `pending` and the endpoint is disabled, the disabled message wins.** It is the
+    actionable one. Recommended default: accept.
+    **Resolved (PM default, accepted as designed): the disabled message wins.**
+27. **Q27 (US-007): Replaying a `succeeded` delivery sends the same `webhook-id`**, so a receiver that dedupes correctly
+    may ignore it. That is what the AC asks for (same `webhook-id`). Recommended default: accept and say so in the README.
+    **Resolved (PM default, accepted as designed): same `webhook-id`; the README says so.**
+28. **Q28 (US-007): An endpoint disabled after the `202` but before the attempt** gives an `endpoint_disabled` attempt and
+    a `failed` delivery rather than a `409`. Recommended default: accept (the worker is the authority, ADR 0016).
+    **Resolved (PM default, accepted as designed): `endpoint_disabled` attempt, not a `409`.**

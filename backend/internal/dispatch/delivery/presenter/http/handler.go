@@ -20,12 +20,16 @@ type (
 	attemptsLister interface {
 		Execute(ctx context.Context, in usecase.ListDeliveryAttemptsInput) (usecase.ListDeliveryAttemptsOutput, error)
 	}
+	deliveryReplayer interface {
+		Execute(ctx context.Context, in usecase.ReplayDeliveryInput) (usecase.ReplayDeliveryOutput, error)
+	}
 )
 
 // UseCases groups the dispatch use cases that have a route.
 type UseCases struct {
 	EndpointDeliveries endpointDeliveriesLister
 	Attempts           attemptsLister
+	Replay             deliveryReplayer
 }
 
 // Handler serves the dispatch routes.

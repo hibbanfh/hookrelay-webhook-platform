@@ -34,6 +34,17 @@ type DeliveryUpdate struct {
 	UpdatedAt     time.Time
 }
 
+// ReplayRequest is the state a replay writes: a finished delivery goes back to Status with the
+// given Trigger, due at NextAttemptAt, which is also its updated_at. The row must still be
+// succeeded or failed.
+type ReplayRequest struct {
+	ID            string
+	ProjectID     string
+	Status        string
+	Trigger       string
+	NextAttemptAt time.Time
+}
+
 // DeliveryRow is a deliveries row as the read queries return it, without the lease token. The
 // nullable times are pointers.
 type DeliveryRow struct {
