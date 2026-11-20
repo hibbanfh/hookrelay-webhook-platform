@@ -1,7 +1,7 @@
 # Hookrelay: Architecture
 
 **Status:** v0.1 design, covering MVP scope (US-001 to US-008, US-010, US-025)
-**Owner:** Architect · **Last updated:** 2026-11-19
+**Owner:** Architect · **Last updated:** 2026-11-20
 **Contract:** [`api/openapi.yaml`](../api/openapi.yaml) · **Decisions:** [`docs/adr/`](adr/)
 
 > **In one paragraph:** Hookrelay is a Go modular monolith with two processes from one binary: an
@@ -61,7 +61,8 @@ flowchart LR
 ```
 
 The dotted line is the built-in **demo receiver** (US-010). It lives in the API process at
-`/demo/receiver/{project_id}`, and it is the only destination on the SSRF allowlist.
+`/demo/receiver/{project_id}`, and it is the only destination on the SSRF allowlist. The allowlist is derived from
+`DEMO_RECEIVER_BASE_URL` and cannot be configured otherwise (ADR 0017).
 
 ## 3. Processes and deployment
 
@@ -70,7 +71,7 @@ The dotted line is the built-in **demo receiver** (US-010). It lives in the API 
 | `api` | `hookrelay api` | REST API, auth, validation, publish transaction, read models, demo receiver | request rate |
 | `worker` | `hookrelay worker` | Claim due deliveries, send signed HTTP, record attempts, schedule retries | backlog × receiver latency |
 | release | `hookrelay migrate up` | Fly `release_command`, runs before new machines start | n/a |
-| one-off | `hookrelay seed` | Idempotently create the demo project (key from `SEED_DEMO_API_KEY`) and demo endpoints | n/a |
+| one-off | `hookrelay seed` | Idempotently create the demo project (key from `SEED_DEMO_API_KEY`) and its two demo receiver endpoints (healthy, `?fail_first=2`), matched by exact URL (ADR 0017 §5) | n/a |
 | `web` | `node server.js` (Next.js standalone) | Dashboard pages, `/auth/sign-up\|sign-in\|sign-out` (calls Neon Auth server-side), `/api/v1/*` proxy | request rate |
 
 One Go binary and one image (ADR 0002). On Fly.io, `fly.toml` defines `[processes]` for `api` and
@@ -283,7 +284,8 @@ domain's port or a CLI command.
 | Value | `SigningSecret` | `NewSigningSecret(32 random bytes)`, `String()` renders `whsec_<b64>`, `LogValue()` redacts |
 | Errors | `ErrNotFound`, `ErrInvalid` (+ `ValidationError`), `ErrLimitReached` (409, message names the limit) | |
 | Port | `EndpointRepository{Create, Get, List, UpdateFields, CountForUpdate}` | `CountForUpdate` locks the `projects` row `FOR NO KEY UPDATE`, then counts in a second statement, and must run in a tx. `UpdateFields` uses `COALESCE` per field so concurrent patches of different fields don't clobber each other |
-| Port | `SecretReader{GetSecret, ListSecretsByURLPrefix}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox` |
+| Port | `SecretReader{GetSecret, ListDemoSecrets}` | decrypts via the injected `SecretCipher` port, implemented by `library/secretbox`. `ListDemoSecrets` (US-010): endpoints whose `url` = the receiver URL or starts with it + `?` (`starts_with`, not `LIKE`: IDs contain `_`), ≤ 20, unreadable secrets skipped |
+| Port | `EndpointURLLister{ListURLs(ctx, projectID)}` | US-010, seed only. Joins the caller's tx (after `CountForUpdate`) |
 | Port | `DeliveryTargetReader{GetTargets(ctx, ids) (TargetBatch{Targets, Unreadable}, error)}` | US-004. System-level batch read for the worker; opens each secret with `SecretCipher`. A secret that fails to open is listed in `Unreadable` instead of failing the batch. The publish fan-out reads `endpoints` from `message/data` instead (ADR 0013) |
 | Port | `URLPolicy{Check(ctx, rawURL) error}` | implemented by `library/netguard`. Non-nil means rejected; the use case converts it to `ValidationError{Field:"url"}` |
 | Ports (usecase) | `Clock`, `IDGenerator`, `RandomSource`, `TxManager` | |
@@ -294,7 +296,8 @@ domain's port or a CLI command.
 | Use case | `UpdateEndpoint` | `PATCH /v1/endpoints/{id}`. Get → ApplyPatch → URLPolicy (whenever `url` is present) → UpdateFields |
 | Use case | `GetDeliveryTargets` | internal, batch `{project_id, url, enabled, secret}` by IDs for `dispatch.EndpointCatalog` (US-004, ADR 0014). One `WHERE id = ANY($1)` query |
 | Use case (reused) | `GetEndpoint` | also behind `dispatch.EndpointStateReader` (adapter) for ownership and `enabled` checks (US-006/US-007). No separate `GetEndpointState` (ADR 0015) |
-| Use case | `ListDemoSigningSecrets` | internal, secrets of a project's endpoints whose URL starts with the demo receiver prefix (US-010) |
+| Use case | `ListDemoSigningSecrets` | internal, for `demoreceiver.SecretSource` (US-010). Input `{ProjectID, ReceiverURL}`; ≤ 20 candidates; empty URL (receiver disabled) → no query |
+| Use case | `SeedDemoEndpoints` | internal, `hookrelay seed` (US-010). Validate + `URLPolicy` before the tx; tx{`CountForUpdate` → `ListURLs` → create the missing specs under the limit}. Idempotent and race-safe through the project row lock |
 
 ### 5.3 `message`: publish, idempotency, read model
 
@@ -353,15 +356,22 @@ fenced completion, catalog adapters, shutdown). Replay (US-007): ADR 0016, plan 
 
 ### 5.5 `demoreceiver`: built-in receiver that fails on purpose (US-010)
 
+Full plan: [`docs/plans/us-010.md`](plans/us-010.md). Decisions: ADR 0017.
+
 | Kind | Name | Notes |
 |---|---|---|
-| Value | `FailurePlan{FailFirst int}` (0-10) | `ShouldFail(requestNumber) bool` |
-| Func | `Verify(secret, id, ts, body, header) bool` | Its own Standard Webhooks verifier with `hmac.Equal`. It deliberately does *not* reuse `dispatch.Sign`, so it is an independent interoperability check |
-| Errors | `ErrInvalidSignature` (401), `ErrStaleTimestamp` (401), `SimulatedFailure{RequestNumber, FailFirst}` (500 `simulated_failure`) | |
-| Port (cross-domain) | `SecretSource{DemoSecrets(ctx, projectID) ([]Candidate{EndpointID, Secret}, error)}` | → `endpoint.ListDemoSigningSecrets` (≤ 20 candidates) |
-| Port | `HitCounter{Increment(ctx, endpointID, webhookID, now) (int, error)}` | `INSERT ... ON CONFLICT DO UPDATE SET hits = hits + 1 RETURNING hits`. In Postgres so it is correct across API instances |
-| Ports (usecase) | `Clock` | 5-minute timestamp tolerance |
-| Use case | `ReceiveWebhook` | `POST /demo/receiver/{project_id}?fail_first=N` |
+| Value | `FailurePlan{FailFirst int}` (0-10) | `NewFailurePlan` → `ValidationError{fail_first}`; `ShouldFail(n) = n ≤ FailFirst` |
+| Value | `SignedWebhook{ID, Timestamp, Body, Signatures SignatureSet}`, `WebhookHeaders` | `ParseSignedWebhook`: exactly one of each header; id 1-255 printable ASCII; ts 1-12 digits; 1-10 `v1,` entries, other versions ignored. `IsFresh(now)`: ±5 min both ways |
+| Value | `SignatureSet.Contains(expected)` | `hmac.Equal` over every entry (constant time per entry; length is public) |
+| Value | `SigningKey` (redacts itself), `Candidate{EndpointID, Key}`, `HitKey{EndpointID, WebhookID}`, `Receipt`, `HitRetention = 7 d` | |
+| Func | `IsProjectID` | malformed path ID → `404` without a lookup |
+| Errors | `ErrInvalidSignature`, `ErrStaleTimestamp` (both wrap `ErrUnauthorized` → 401), `ErrNotFound` (404), `ValidationError` (400), `SimulatedFailure{RequestNumber, FailFirst}` (500 `simulated_failure`, not logged as a server error) | |
+| Port (cross-domain) | `SecretSource{DemoSecrets(ctx, projectID) ([]Candidate, error)}` | → `endpoint.ListDemoSigningSecrets` (adapter composes `{DEMO_RECEIVER_BASE_URL}/{project_id}`). Unknown project → empty slice |
+| Port (cross-domain) | `Signer{Sign(key, id, ts, body) string}` | → `dispatch/domain/entity.Sign` (adapter). One HMAC implementation in the repo; ADR 0017 §2 explains why there is no independent verifier any more |
+| Port | `HitCounter{Increment(ctx, HitIncrement{Key, At, ExpiredBefore}) (int, error)}` | One statement: upsert `+1` (reset to 1 if idle > 7 d) plus a sweep of ≤ 100 other expired rows (`FOR UPDATE SKIP LOCKED`). In Postgres so it is exact across API machines and restarts |
+| Ports (usecase) | `Clock` | |
+| Use case | `ReceiveWebhook` | `POST /demo/receiver/{project_id}?fail_first=N`. Plan → parse → fresh → candidates → match → count → fail or receipt. Counts only verified requests |
+| Adapter in | `delivery/presenter/http` | public route (no guard), registered only when `DEMO_RECEIVER_ENABLED`. Reads the raw body (`httpx.ReadBody`), never parses it |
 
 ### 5.6 Cross-domain adapter map (`backend/wire/adapters.go`)
 
@@ -373,7 +383,8 @@ The publish path needs no adapter. `message.EndpointDirectory` and `message.Deli
 | `dispatch.EndpointCatalog` | `endpoint.GetDeliveryTargets` | worker |
 | `dispatch.EndpointStateReader` | `endpoint.GetEndpoint` | endpoint deliveries (US-006), replay (US-007) |
 | `dispatch.MessageCatalog` | `message.GetMessagePayloads` | worker |
-| `demoreceiver.SecretSource` | `endpoint.ListDemoSigningSecrets` | demo receiver |
+| `demoreceiver.SecretSource` | `endpoint.ListDemoSigningSecrets` | demo receiver (US-010) |
+| `demoreceiver.Signer` | `dispatch/domain/entity.Sign` (a pure function, not a use case: the one sanctioned exception, ADR 0017 §2) | demo receiver (US-010) |
 
 ## 6. API surface (summary; the contract is `api/openapi.yaml`)
 
@@ -400,8 +411,13 @@ The publish path needs no adapter. `message.EndpointDirectory` and `message.Deli
 session header, and both resolve to one project. Every "key" route can also return
 `409 project_not_provisioned` and `503 auth_unavailable` (session requests only).
 
-`GET /v1/project` also returns `demo_receiver_url` (`{DEMO_RECEIVER_BASE_URL}/{project_id}` or
-`null`), so the dashboard can offer a "Use demo receiver" button without hard-coding hosts.
+`GET /v1/project` (and the project-creating routes) also returns `demo_receiver_url`
+(`{DEMO_RECEIVER_BASE_URL}/{project_id}`, or `null` when `DEMO_RECEIVER_ENABLED=false`), so the dashboard can offer a
+"Use demo receiver" button without hard-coding hosts. It must be registered verbatim (optionally plus `?fail_first=N`):
+the receiver recognises demo endpoints by exact URL.
+
+The demo receiver route is public but **signature-gated**: an unknown project and a bad signature give the same
+`401`, and `404` only means "receiver disabled" or "not a project ID" (ADR 0017 §3).
 
 ## 7. Data model
 
@@ -519,15 +535,17 @@ CREATE TABLE attempts (
   CHECK (NOT response_body_truncated OR response_body IS NOT NULL)
 );
 
--- 0006 (US-010)
+-- 0006 (US-010, ADR 0017): owned by demoreceiver; rows only for verified requests; swept after 7 idle days
 CREATE TABLE demo_receiver_hits (
-  endpoint_id   text NOT NULL REFERENCES endpoints(id),
-  webhook_id    text NOT NULL,
-  hits          integer NOT NULL,
+  endpoint_id   text NOT NULL REFERENCES endpoints (id) ON DELETE CASCADE,  -- disposable: never blocks a delete
+  webhook_id    text NOT NULL CHECK (char_length(webhook_id) BETWEEN 1 AND 255),
+  hits          integer NOT NULL CHECK (hits >= 1),
   first_seen_at timestamptz NOT NULL,
   last_seen_at  timestamptz NOT NULL,
-  PRIMARY KEY (endpoint_id, webhook_id)
+  PRIMARY KEY (endpoint_id, webhook_id),
+  CHECK (last_seen_at >= first_seen_at)
 );
+CREATE INDEX demo_receiver_hits_last_seen_idx ON demo_receiver_hits (last_seen_at);  -- write-path sweep
 ```
 
 ### 7.2 Entity-relationship view
@@ -591,7 +609,7 @@ erDiagram
 | 0003 | US-002 | `endpoints` |
 | 0004 | US-003 | `messages`, `idempotency_keys`, `deliveries` + indexes (written) |
 | 0005 | US-004 | `attempts` (no change to `deliveries`; SQL in `docs/plans/us-004.md` section 5) |
-| 0006 | US-010 | `demo_receiver_hits` |
+| 0006 | US-010 | `demo_receiver_hits` + `last_seen_at` index (new empty table, FK to `endpoints` with `ON DELETE CASCADE`; SQL in `docs/plans/us-010.md` step 4) |
 
 US-025 took number 0002 because it ships before US-002. US-003 merged the planned `messages` and
 `deliveries` migrations into one, so `attempts` and `demo_receiver_hits` moved to 0005 and 0006
@@ -847,24 +865,48 @@ RETURNING id, project_id, message_id, endpoint_id, status, trigger, attempt_coun
 
 ### 8.5 Demo receiver (US-010)
 
-`POST /demo/receiver/{project_id}?fail_first=N`:
-1. Handler: body ≤ 256 KB, reads the `webhook-*` headers, validates `fail_first` ∈ [0, 10].
-2. `ReceiveWebhook`: if the timestamp is outside ±5 min → `ErrStaleTimestamp`.
-   `SecretSource.DemoSecrets(projectID)` returns secrets of that project's endpoints whose URL
-   starts with `{DEMO_RECEIVER_BASE_URL}/{project_id}`. Each is checked with `Verify`, and if
-   none matches → `ErrInvalidSignature` (401). The matched endpoint ID is the counter key.
-3. `HitCounter.Increment(endpointID, webhookID)` → n. If `n ≤ fail_first` →
-   `SimulatedFailure` → `500 simulated_failure` (the message says "request n of N"). Otherwise
-   `200 {received, endpoint_id, webhook_id, request_number}`.
+Decisions: ADR 0017. Plan: [`docs/plans/us-010.md`](plans/us-010.md).
 
-Retries and replays reuse the same `webhook-id`, so `fail_first=2` shows two failed attempts
-(5 s and 30 s apart) followed by a success, about 35 s end to end. The seed creates two demo
-endpoints in the demo project: **"Demo receiver (healthy)"** (`fail_first=0`) and **"Demo
-receiver (flaky: fails twice)"** (`fail_first=2`). One publish then shows fan-out, retries and
-success together.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as worker (unchanged)
+    participant H as demoreceiver handler (api process)
+    participant U as ReceiveWebhook
+    participant S as SecretSource (endpoint.ListDemoSigningSecrets)
+    participant DB as Postgres
+    W->>H: POST {base}/{project_id}?fail_first=2 (webhook-id/-timestamp/-signature, raw body ≤ 256 KB)
+    H->>H: IsProjectID? else 404 · fail_first int 0-10? else 400 · ReadBody (413)
+    H->>U: Execute(projectID, failFirst, headers, body)
+    U->>U: ParseSignedWebhook, IsFresh(now ± 5 min), else 401
+    U->>S: DemoSecrets(projectID)
+    S->>DB: endpoints WHERE project_id AND (url = base/P OR starts_with(url, base/P?)) LIMIT 20
+    U->>U: first candidate with Sign(key, id, ts, body) ∈ signatures (hmac.Equal), else 401
+    U->>DB: upsert demo_receiver_hits (endpoint, webhook-id) RETURNING hits, sweep ≤ 100 expired
+    alt hits ≤ fail_first
+        H-->>W: 500 simulated_failure "request n of N" (attempt failed → retried on schedule)
+    else
+        H-->>W: 200 {received, endpoint_id, webhook_id, request_number, fail_first}
+    end
+```
 
-SSRF: `OUTBOUND_ALLOWLIST` defaults to `DEMO_RECEIVER_BASE_URL`, so the demo receiver works even
-when it is reached over a private address (compose `http://api:8080`, or Fly private networking).
+- **Counter in Postgres** (ADR 0017 §1): exact across API machines, restarts and deploys; one upsert per verified
+  request; idle rows reset after 7 days and are swept on the write path, ≤ 100 per request. Keyed per endpoint so
+  two flaky endpoints that receive one message each fail on their own.
+- **Auth** (ADR 0017 §3): signature-gated public route. An unknown project and a bad signature give the same `401`
+  body. Only verified requests are counted. No rate limit yet (an anonymous request costs ≤ 1 read and ≤ 20 HMACs).
+- **Signing code reused:** `Signer` port → `dispatch.Sign` in `wire/adapters.go`; parsing, tolerance and
+  constant-time compare live in `demoreceiver/domain/entity`.
+- **SSRF** (ADR 0017 §4): the netguard allowlist is exactly `DEMO_RECEIVER_BASE_URL` (or empty when disabled), and
+  it is validated at startup (must end with `/demo/receiver`, no query, no dot segments). The same match picks the
+  client at send time, and its dialer reaches only that host:port. Other paths and ports on the same private host
+  use the guarded dialer and are blocked in production. Development is unchanged (no checks).
+- **Timing:** retries and replays reuse the same `webhook-id`, so `fail_first=2` shows two failed attempts (5 s and
+  30 s apart) followed by a success, about 35 s end to end. The seed creates two demo endpoints in the demo project:
+  **"Demo receiver (healthy)"** (`{base}/{project_id}`) and **"Demo receiver (flaky: fails twice)"**
+  (`…?fail_first=2`). One publish then shows fan-out, retries and success together.
+- **Where it runs:** compose `http://api:8080/demo/receiver` (the worker reaches the API by service name). Fly uses
+  the default `{PUBLIC_BASE_URL}/demo/receiver` (public https, reached through the Fly edge).
 
 ## 9. Consistency, concurrency and idempotency (summary)
 
@@ -882,6 +924,8 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 | Replay vs. endpoint disable | Checked before the update, not atomically; the worker re-reads `enabled` after the claim and records `endpoint_disabled` (ADR 0016) |
 | Duplicate HTTP sends | Accepted (at-least-once). Stable `webhook-id` = message ID |
 | Read-your-writes in dashboard | Single primary. Reads go to the same DB |
+| Demo receiver counter | `INSERT ... ON CONFLICT DO UPDATE SET hits = hits + 1 RETURNING hits` takes the row lock, so concurrent hits are numbered exactly; the sweep uses `SKIP LOCKED` and skips the current key (ADR 0017) |
+| Seed vs. seed / vs. create | `SeedDemoEndpoints` runs under the same `projects` row lock as `CreateEndpoint`, so demo endpoints are never duplicated and the limit holds |
 
 ## 10. Failure modes
 
@@ -911,7 +955,7 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
   scale, partition `attempts` and `messages` by month and drop partitions instead of deleting.
 - **N+1 avoided:** message list = 2 queries (page + `GROUP BY` counts). Worker batch = 3 queries
   (claim + targets + payloads). Message detail, endpoint deliveries and attempts = 2 queries each
-  (ADR 0015). Replay = 3 (delivery, endpoint state, conditional update; ADR 0016). Auth = 1 indexed lookup per request.
+  (ADR 0015). Replay = 3 (delivery, endpoint state, conditional update; ADR 0016). Demo receiver = 1 read (≤ 20 candidate secrets) + 1 upsert after a valid signature (ADR 0017). Auth = 1 indexed lookup per request.
   A session request costs 1 Neon call per token per 5 s (cached, `singleflight`) plus 1 indexed
   lookup on `projects.neon_user_id`.
 - **Pools:** API `pgxpool` max 10, worker max 6. `statement_timeout = 5s` and
@@ -934,6 +978,8 @@ when it is reached over a private address (compose `http://api:8080`, or Fly pri
 | **Elevation**: SSRF | netguard at registration and dial time, no redirects, no proxy, explicit allowlist (ADR 0003) |
 | **DoS** | 256 KB body limit, server timeouts (`ReadHeaderTimeout` 5 s, `ReadTimeout` 15 s, `WriteTimeout` 20 s, `IdleTimeout` 120 s), per-request 10 s context, 20 endpoints per project, 4 KB stored response bodies, DB statement timeout. Replay allows at most one queued or in-flight attempt per delivery (409 otherwise). Rate limiting is P1 (US-012) |
 | **Abuse of the public demo** (shared, documented key) | Project creation off in production. Endpoint limit. Optionally `OUTBOUND_ALLOWLIST_ONLY=true` (demo receiver only; see Q1). Periodic demo reset (Q4) |
+| **Spoofing / DoS on the demo receiver** (public route) | Standard Webhooks signature with the secret of one of the project's demo endpoints, ±5 min, `hmac.Equal`; one `401` for unknown project and bad signature; nothing is written before the signature verifies; ≤ 20 candidates; 256 KB body; counter rows swept after 7 days (ADR 0017). Rate limits are US-012 |
+| **Elevation via the allowlist** | The allowlist is derived (only `DEMO_RECEIVER_BASE_URL`), validated at startup; scheme + host + port + path prefix, dot segments refused; allowlisted dialer limited to that host:port; no redirects (ADR 0003, ADR 0017) |
 | **Spoofing** a dashboard user | Neon Auth owns passwords and sessions. Go checks every session with Neon itself and does not trust a header from the BFF. The cache holds positive results only, for ≤ 5 s. Errors fail closed (`503`). There is one identical `401`, and requests without a credential never reach Neon (ADR 0011) |
 | **Dashboard XSS / CSRF** | The Neon session lives only in the BFF's encrypted httpOnly `SameSite=Lax` cookie. The browser never talks to Neon, and the API key is shown once from a `no-store` response and kept in React state only. The BFF checks `Origin` on every non-GET request and drops browser-supplied credential headers. The API has no cookies and no CORS (ADR 0011). Payloads and response bodies are rendered as text, never HTML |
 | **Information disclosure**: auth logs | Passwords, Neon cookies, `hr_session` and `X-Hookrelay-Session` are never logged by the BFF or Go. `SessionToken` redacts itself, and verifier errors carry the status, never the token |
@@ -990,10 +1036,10 @@ clear message. All values come from the environment, and `.env.example` mirrors 
 | `WORKER_LEASE_DURATION` | `30s` | must be > `DELIVERY_TIMEOUT` + 5 s (validated) |
 | `WORKER_SHUTDOWN_TIMEOUT` | `25s` | |
 | `WORKER_HEALTH_ADDR` | `:9091` | private |
-| `DEMO_RECEIVER_ENABLED` | `true` | |
-| `DEMO_RECEIVER_BASE_URL` | `{PUBLIC_BASE_URL}/demo/receiver` | compose: `http://api:8080/demo/receiver` (reachable from the worker) |
-| `OUTBOUND_ALLOWLIST` | `{DEMO_RECEIVER_BASE_URL}` | comma-separated URL prefixes exempt from the production SSRF rules |
-| `OUTBOUND_ALLOWLIST_ONLY` | `false` | `true` = only allowlisted destinations may be registered (demo hardening) |
+| `DEMO_RECEIVER_ENABLED` | `true` | `false` → the route is not registered (`404`), `demo_receiver_url` is `null`, the allowlist is empty, and the seed creates no demo endpoints |
+| `DEMO_RECEIVER_BASE_URL` | `{PUBLIC_BASE_URL}/demo/receiver` | compose: `http://api:8080/demo/receiver` (reachable from the worker). Validated when enabled: absolute http(s), host, no userinfo/query/fragment/dot segments/trailing `/`, path ends with `/demo/receiver`. **It is the whole SSRF allowlist** (ADR 0017) |
+| ~~`OUTBOUND_ALLOWLIST`~~ | removed in US-010 | Startup fails if it is set to a non-empty value (ADR 0017 §4) |
+| `OUTBOUND_ALLOWLIST_ONLY` | `false` | `true` = only the demo receiver may be registered (demo hardening, Q1). Rejected with `DEMO_RECEIVER_ENABLED=false` |
 | `SEED_DEMO_API_KEY` | (required for `seed`) | `hr_` + 43 base64url chars; documented in the README for the public demo |
 | `SEED_DEMO_PROJECT_NAME` | `Hookrelay Demo` | |
 | `NEON_AUTH_BASE_URL` | (required in production) | Neon Auth base URL (not secret). Empty in development → session auth disabled (always `401`) |
@@ -1007,7 +1053,8 @@ clear message. All values come from the environment, and `.env.example` mirrors 
 
 - **Entity and use case tests** (fast, fakes): name/URL/event-type invariants, `ApplyOutcome`
   table (every row of §8.3), `RetryPolicy` with fixed jitter, `Sign` against the Standard
-  Webhooks test vector, `Verify` round trip, idempotency branches, replay guards.
+  Webhooks test vector, demo receiver parsing/tolerance/`hmac.Equal` and an end-to-end check with an HMAC computed in
+  the test (US-010), idempotency branches, replay guards.
 - **Handler tests** (`httptest` + fake use cases): error mapping, status codes, the 401 body
   being identical in every case, pagination parameter validation, the route-table auth test.
 - **Repository integration** (Testcontainers Postgres): composite FK isolation, claim with
@@ -1121,13 +1168,12 @@ Decisions: ADR 0016 (reuse `deliveries.trigger`, conditional requeue from the AP
 Wire: `DispatchReadSet` renamed `DispatchAPISet`; rule 5f allowlist gains the new providers.
 
 ### US-010: Demo receiver (now P0)
-1. `demoreceiver/domain`: `plan.go` (`FailurePlan`), `verify.go` (`Verify`), `errors.go`, `repository.go` (`HitCounter`), `ports.go` (`SecretSource`).
-2. `demoreceiver/usecase/receive_webhook.go`. Tests cover stale timestamp, no candidates, wrong signature, fail_first boundary (n = N → fail, n = N+1 → ok).
-3. `endpoint/usecase/list_demo_signing_secrets.go` + `SecretReader.ListSecretsByURLPrefix`.
-4. `migrations/0006_demo_receiver_hits`. `demoreceiver/data/postgres` upsert counter. Integration test: concurrent increments are exact.
-5. HTTP: `POST /demo/receiver/{project_id}` (public, registered only if `DEMO_RECEIVER_ENABLED`). `GET /v1/project` mapper adds `demo_receiver_url`.
-6. `netguard` allowlist wiring. Seed extended: two demo endpoints (`fail_first=0`, `fail_first=2`) when the project is first created.
-7. System test: publish → flaky endpoint shows 500, 500, 200 with gaps of about 5 s and 30 s.
+Full layer-ordered plan, migration SQL, wiring, layer rules and AC → test map: [`docs/plans/us-010.md`](plans/us-010.md).
+Decisions: ADR 0017 (Postgres hit counter with write-path sweep, `Signer` port onto `dispatch.Sign`, one 401 for unknown
+project and bad signature, allowlist derived from `DEMO_RECEIVER_BASE_URL`, `OUTBOUND_ALLOWLIST` removed, seed by exact
+URL under the project lock). Use case: `demoreceiver.ReceiveWebhook`; internal `endpoint.ListDemoSigningSecrets` and
+`endpoint.SeedDemoEndpoints`. Ports: `SecretSource`, `Signer`, `HitCounter`, `Clock`; `endpoint.SecretReader.ListDemoSecrets`,
+`endpoint.EndpointURLLister`. Adapters: `demoSecretSource`, `demoSigner`. Migration `0006_demo_receiver_hits`. No worker change.
 
 ### US-008: Dashboard (frontend-engineer)
 1. `npm run gen:api` (`openapi-typescript api/openapi.yaml -o src/lib/api/schema.d.ts`), plus an `openapi-fetch` client with `baseUrl: "/api"`.
@@ -1218,3 +1264,27 @@ Wire: `DispatchReadSet` renamed `DispatchAPISet`; rule 5f allowlist gains the ne
 28. **Q28 (US-007): An endpoint disabled after the `202` but before the attempt** gives an `endpoint_disabled` attempt and
     a `failed` delivery rather than a `409`. Recommended default: accept (the worker is the authority, ADR 0016).
     **Resolved (PM default, accepted as designed): `endpoint_disabled` attempt, not a `409`.**
+29. **Q29 (US-010): Demo counters reset after 7 idle days.** A replay of a message more than a week after its last request
+    to a `fail_first` endpoint fails again (and manual attempts are not retried). Recommended default: accept; a demo
+    session lasts minutes.
+    **Resolved (PM default, accepted as designed): counters reset after 7 idle days.**
+30. **Q30 (US-010): `fail_first` counts per (endpoint, `webhook-id`), not per `webhook-id` alone,** so the healthy and the
+    flaky demo endpoint each behave as labelled for the same message. Recommended default: accept (it matches the intent of the AC).
+    **Resolved (PM default, accepted as designed): per (endpoint, `webhook-id`).**
+31. **Q31 (US-010): An unknown project on the demo receiver is `401`, not `404`,** so the receiver never reveals which
+    projects exist; `404` means "receiver disabled" or "not a project ID". Recommended default: accept.
+    **Resolved (PM default, accepted as designed): unknown project is `401`.**
+32. **Q32 (US-010): `OUTBOUND_ALLOWLIST` is removed;** the demo receiver is the only allowlisted destination by
+    construction. An operator cannot allowlist another internal host without an ADR. Recommended default: accept (it is
+    what the AC says).
+    **Resolved (PM default, accepted as designed): `OUTBOUND_ALLOWLIST` removed; setting it is a startup error.**
+33. **Q33 (US-010): No rate limit on the public demo receiver** until US-012. Unsigned requests cost one read and write
+    nothing. Recommended default: accept.
+    **Resolved (PM default, accepted as designed): no rate limit until US-012.**
+34. **Q34 (US-010): The seed only adds missing demo endpoints.** It does not re-enable one a reviewer disabled, or remove
+    extra endpoints; with 20 endpoints already in the demo project it fails loudly. Recommended default: accept and
+    handle cleanup with the demo reset (Q4).
+    **Resolved (PM default, accepted as designed): the seed only adds missing demo endpoints.**
+35. **Q35 (US-010): `fail_first` is capped at 10.** Values of 6 or more make every automatic attempt of the default schedule
+    fail, so only a manual replay succeeds (a useful demo of replay). Recommended default: accept.
+    **Resolved (PM default, accepted as designed): `fail_first` capped at 10.**

@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"hookrelay/internal/dispatch/delivery/worker"
+	endpointuc "hookrelay/internal/endpoint/domain/usecase"
 	projectuc "hookrelay/internal/project/domain/usecase"
 )
 
@@ -23,6 +24,7 @@ type Worker struct {
 
 // Seed is the object graph of the seed subcommand.
 type Seed struct {
-	DemoProject *projectuc.SeedDemoProject
-	Log         *slog.Logger
+	DemoProject   *projectuc.SeedDemoProject
+	DemoEndpoints *endpointuc.SeedDemoEndpoints
+	Log           *slog.Logger
 }

@@ -61,11 +61,15 @@ type Config struct {
 	WorkerShutdownTimeout   time.Duration
 	WorkerHealthAddr        string
 	DemoReceiverEnabled     bool
-	DemoReceiverBaseURL     string
-	OutboundAllowlist       []string
-	OutboundAllowlistOnly   bool
-	SeedDemoAPIKey          string
-	SeedDemoProjectName     string
+	// DemoReceiverBaseURL must be reachable from the worker. When the receiver is enabled it is the
+	// only allowlisted (SSRF-exempt) destination.
+	DemoReceiverBaseURL string
+	// OutboundAllowlist is derived, never read from the environment: DemoReceiverBaseURL when the
+	// receiver is enabled, empty otherwise (ADR 0017).
+	OutboundAllowlist     []string
+	OutboundAllowlistOnly bool
+	SeedDemoAPIKey        string
+	SeedDemoProjectName   string
 
 	NeonAuthBaseURL       string
 	NeonAuthSessionCookie string
@@ -85,7 +89,9 @@ func Load(getenv Getenv) (Config, error) {
 	r := &reader{get: getenv}
 	appEnv := r.oneOf("APP_ENV", EnvDevelopment, EnvDevelopment, EnvProduction)
 	publicURL := r.str("PUBLIC_BASE_URL", "http://localhost:8080")
-	demoBase := r.str("DEMO_RECEIVER_BASE_URL", strings.TrimRight(publicURL, "/")+"/demo/receiver")
+	demoEnabled := r.boolean("DEMO_RECEIVER_ENABLED", true)
+	demoBase := r.str(envDemoBaseURL, strings.TrimRight(publicURL, "/")+demoReceiverPath)
+	r.removed(envRemovedAllowlist, removedAllowlistReason)
 
 	neon := r.neonAuthSettings()
 
@@ -109,10 +115,10 @@ func Load(getenv Getenv) (Config, error) {
 		WorkerLeaseDuration:     r.duration("WORKER_LEASE_DURATION", "30s"),
 		WorkerShutdownTimeout:   r.duration("WORKER_SHUTDOWN_TIMEOUT", "25s"),
 		WorkerHealthAddr:        r.str("WORKER_HEALTH_ADDR", ":9091"),
-		DemoReceiverEnabled:     r.boolean("DEMO_RECEIVER_ENABLED", true),
+		DemoReceiverEnabled:     demoEnabled,
 		DemoReceiverBaseURL:     demoBase,
-		OutboundAllowlist:       splitList(r.str("OUTBOUND_ALLOWLIST", demoBase)),
-		OutboundAllowlistOnly:   r.boolean("OUTBOUND_ALLOWLIST_ONLY", false),
+		OutboundAllowlist:       demoAllowlist(demoEnabled, demoBase),
+		OutboundAllowlistOnly:   r.boolean(envAllowlistOnly, false),
 		SeedDemoAPIKey:          r.str("SEED_DEMO_API_KEY", ""),
 		SeedDemoProjectName:     r.str("SEED_DEMO_PROJECT_NAME", "Hookrelay Demo"),
 		NeonAuthBaseURL:         neon.baseURL,
@@ -122,6 +128,7 @@ func Load(getenv Getenv) (Config, error) {
 		SessionCacheTTL:         neon.cacheTTL,
 	}
 	r.add(validateCross(cfg))
+	r.add(validateDemoReceiver(cfg))
 	r.add(validateNeonAuth(cfg))
 	if err := errors.Join(r.errs...); err != nil {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
@@ -194,6 +201,13 @@ func (r *reader) str(name, def string) string {
 		return def
 	}
 	return v
+}
+
+// removed fails when a variable that no longer exists is still set, naming why.
+func (r *reader) removed(name, reason string) {
+	if r.str(name, "") != "" {
+		r.fail(name, "%s", reason)
+	}
 }
 
 func (r *reader) required(name string) string {

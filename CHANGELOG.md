@@ -4,7 +4,15 @@ All notable changes to Hookrelay. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Changed (breaking config)
+- `OUTBOUND_ALLOWLIST` is removed (US-010, ADR 0017). The SSRF allowlist is now derived: exactly `[DEMO_RECEIVER_BASE_URL]` when the demo receiver is enabled, empty otherwise. Setting `OUTBOUND_ALLOWLIST` to any non-empty value is a startup error, and so is `OUTBOUND_ALLOWLIST_ONLY=true` with the demo receiver disabled. Remove the variable from any deployment secrets before upgrading.
+
 ### Added
+- US-010: built-in demo receiver with failure simulation (ADR 0017).
+  - `POST /demo/receiver/{project_id}[?fail_first=N]` (public, signature-gated) verifies the Standard Webhooks signature against the project's demo endpoints (exact URL match, at most 20 secrets, `hmac.Equal`, ±5 min timestamp tolerance, at most 10 `v1` signatures, 256 KB body limit) and returns `500 simulated_failure` for the first N (0-10) verified requests per (endpoint, `webhook-id`), then `200` with a `DemoReceiverResult`. An unknown project and a bad signature get a byte-identical `401`; nothing is counted before verification.
+  - Counters live in Postgres (migration 0006 `demo_receiver_hits`): an autocommit upsert followed by a separate bounded sweep (at most 100 expired rows, `SKIP LOCKED`), so counts are distinct under concurrency, survive restarts and multiple API machines, and reset after 7 idle days.
+  - `hookrelay seed` idempotently creates "Demo receiver (healthy)" and "Demo receiver (flaky: fails twice)" endpoints for the demo project. `DEMO_RECEIVER_ENABLED=false` removes the route (`404`), the `demo_receiver_url` (`null`), the allowlist entry and the seeded endpoints. Netguard now also rejects userinfo in `IsAllowlisted`.
+  - Verified end to end: publish → worker → flaky demo endpoint shows attempts 500, 500, 200 (Go E2E with a `1s,2s` schedule, and a manual compose run with the default schedule).
 - US-007: manually replay a delivery (ADR 0016).
   - `POST /v1/deliveries/{id}/replay` moves a `failed` or `succeeded` delivery back to `pending` with `trigger = manual` and `next_attempt_at = now`, and returns `202` with the delivery. The worker makes the attempt on its next poll with the same `webhook-id` and body, a fresh `webhook-timestamp` and a recomputed signature, to the endpoint's current URL and secret. A failed manual attempt is final (no automatic retries); earlier attempts are untouched and `attempt_number` keeps counting.
   - One conditional, project-scoped `UPDATE ... WHERE status IN ('succeeded','failed')`, so concurrent replays give exactly one `202` (verified with 10 goroutines) and a pending delivery (waiting, retry scheduled or in flight) is `409 conflict` "delivery is already pending". A disabled endpoint is `409` "endpoint is disabled"; foreign, unknown or malformed IDs are `404`. No migration and no worker change: the existing `deliveries.trigger` column and `ApplyOutcome` already handle manual attempts.

@@ -230,6 +230,37 @@ Not tested: the real default delays (5s..1h, only sampled), a manual replay end 
 
 Verdict: all 7 criteria PASS. No new bugs. The story is not marked done (caller decides).
 
+## US-010 (built-in demo receiver with failure simulation)
+
+QA verification, 2026-11-20. Changes uncommitted. Legend: E1..E10 = `wire/demoreceiver_integration_test.go`; QA = `wire/demoreceiver_qa_integration_test.go` (added by QA, `TestDemoReceiverQA`, 84 subtests); ENT/UC/HND/REPO = `internal/demoreceiver/...` entity, use case, handler and hit-counter tests; NG = `library/netguard/demo_receiver_test.go`; CFG = `platform/config/demo_receiver_test.go`; SEED = `cmd/server/seed*_test.go`.
+
+| # | Criterion | Verdict | Evidence |
+|---|---|---|---|
+| 1 | `?fail_first=2`: 500 for the first 2 requests per (endpoint, webhook-id), 200 after | PASS | ENT `ShouldFail` boundaries; UC counter 1/2 -> `SimulatedFailure`, 3 -> receipt; REPO exact count under 50-way concurrency, TTL, sweep; HND 500 `simulated_failure` and no error log; E1 (publish -> real worker -> receiver: attempts `500, 500, 200`, bodies `request 1 of 2`, `request 2 of 2`, `request_number 3`, gaps >= 0.9 s / 1.8 s), E2 (per endpoint), E3 (replay after success -> attempt 4 is 200, `request_number 4`); QA changing `fail_first` (0 -> 3 -> 10 -> 0 on one webhook-id: counting continues, the current value decides); QA fail_first 0, absent, 10 |
+| 2 | Verifies the signature, 401 if invalid | PASS | E4 (HMAC computed by the test: valid, flipped byte, random key, 301 s old and ahead, two signatures with the second valid, missing signature), E5 (unknown project and another tenant's secret: byte-identical 401); QA: 1-byte body change, signature of another id, timestamp or body, missing, duplicated and malformed headers, ten-entry signature header (valid first, middle, last = 200; valid as 11th = 401), another version only = 401, timestamps (299 s ok, 302 s refused, non-numeric, negative, `1e9`, overflow, empty), webhook-id 255 ok and 256 = 401, space and unicode ids = 401, empty, non-JSON, whitespace and unicode bodies signed = 200, refusals leave the counter alone (one row, 2 hits) |
+| 3 | Production: the demo receiver is the only internal destination (registration, dial, other paths and ports, empty when disabled) | PASS | CFG (derived allowlist, `OUTBOUND_ALLOWLIST` removed, base URL validation, disabled -> empty); NG (other path, port, scheme, host spelling, dot and backslash segments, userinfo; `AllowlistOnly`; empty allowlist; `AllowlistedDial` refuses other ports; `IsAllowlisted` agrees with `Check`); E7 (production registration of `/v1/projects`, `/healthz`, dot-dot, port+1, `localhost`, https, `receiver-evil` -> 400 field `url`; demo URL with and without query -> 201); E8 (a row pointing at `/healthz` on the API's own port: `destination_blocked`, no `/healthz` in the API access log); E9 (disabled: `cfg.OutboundAllowlist` nil) |
+| N1 | `hookrelay seed` creates the demo endpoints, idempotently | PASS | SEED integration (run 1: project + healthy + flaky with exact URLs; run 2: same IDs, 0 created; disabled endpoint untouched; receiver disabled: project only); endpoint concurrency test; live run below |
+| N2 | `demo_receiver_url` in `GET /v1/project`, null when disabled; disabled -> route 404 | PASS | project handler tests (`demo_receiver_url_test.go`); E9 (404 "route not found", `demo_receiver_url: null` present); live `GET /v1/project` returned `http://api:8080/demo/receiver/proj_...` |
+
+Response shape: QA asserts every 200 has exactly the five `DemoReceiverResult` keys (additionalProperties false), `received: true` and `Content-Type: application/json`; every 4xx/5xx is a single `{"error":{code,message[,field]}}` envelope; every 401 has code `unauthorized` and `WWW-Authenticate`. The 401 body for an unknown project equals the bad-signature body (E5).
+
+Edge cases probed (QA): `fail_first` `0`, `10`, `11`, `-1`, `abc`, empty, `2.0`, `1e1`, `0x2`, ` 2`, a 20-digit number, repeated (different and equal values), plus an unrelated parameter; refused values counted nothing. Body: exactly 262144 bytes signed -> 200; 262145 -> 413 (also unsigned: 413 before any signature work); empty and binary bodies. Methods: GET, PUT, DELETE -> 405; no project id, extra segment, lower-case id, unicode id, endpoint id -> 404; well-formed unknown project -> 401. The exact +-300 s clock edge cannot be hit with the real clock in a black-box test; it is pinned by ENT `IsFresh` at -301/-300/0/+300/+301 and the UC test with an injected clock, and QA checks 299 s inside and 302 s beyond.
+
+Bug found: BUG-QA-015 (minor). An out-of-range `fail_first` (for example 99) with an oversized body gets 413, not the 400 that the openapi order of checks promises; the range is validated in the use case after the body read. Pinned in QA.
+
+Manual compose check (plan section 6), 2026-11-20: `docker compose up -d --build postgres migrate seed api worker` (web skipped, no UI in this story), default `RETRY_SCHEDULE`, development mode (so the production SSRF path is covered by E7 and E8 only).
+- Seed log: `"created":false,"demo_endpoints_created":2,"demo_endpoints_existing":0` (existing DB, project already there); `docker compose run --rm seed` again: `"demo_endpoints_created":0,"demo_endpoints_existing":2`. Idempotent.
+- `GET /v1/endpoints` with the demo key: `http://api:8080/demo/receiver/proj_...` ("Demo receiver (healthy)") and the same URL with `?fail_first=2` ("Demo receiver (flaky: fails twice)"), both enabled.
+- `POST /v1/messages` at 05:45:46Z; 42 s later `GET /v1/messages/{id}`: both deliveries `succeeded`; healthy `attempt_count 1`, flaky `attempt_count 3`.
+- Flaky attempts: #1 05:45:47.08 `500` "request 1 of 2"; #2 05:45:52.61 `500` "request 2 of 2" (5.5 s later); #3 05:46:25.27 `200`, `request_number 3` (32.7 s later). Healthy: 200, `request_number 1`, `fail_first 0`.
+- `POST /v1/deliveries/{flaky}/replay` -> 202; attempt #4 `trigger manual`, `200`, `request_number 4`.
+- ERROR-level lines in the api and worker logs: 0 and 0 (simulated failures are not logged as errors).
+- Containers stopped afterwards (`docker compose stop`; volume kept).
+
+Gates: `REQUIRE_DOCKER=1 go test -tags integration -count=1 -p 1 ./wire/ ./internal/demoreceiver/... ./internal/endpoint/... ./cmd/server/ ./migrations/...` all ok (wire 154 s, demoreceiver repository 83 s, endpoint repository 199 s, cmd/server 53 s, migrations 49 s); the QA file alone re-run after the last edit: ok, 84 subtests. `go test -count=1 ./...`: every package ok except `internal/project/data/neonauth` ("fork/exec ... neonauth.test.exe: Access is denied", the known Windows issue, unrelated). `gofmt -l .` empty, `golangci-lint run --build-tags integration ./wire/...` 0 issues, `bash scripts/check-layers.sh` "layer rules: OK". Not run: `-race` (no gcc), Linux-only process tests.
+
+Verdict: all 3 criteria and both story notes PASS. One new minor bug (BUG-QA-015). The story status is left for the caller.
+
 ## Bugs
 
-BUG-QA-001..014, see `docs/backlog.md` (section "Bugs (QA)").
+BUG-QA-001..015, see `docs/backlog.md` (section "Bugs (QA)").

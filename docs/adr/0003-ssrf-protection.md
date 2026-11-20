@@ -1,6 +1,6 @@
 # ADR 0003: SSRF protection with registration-time validation and dial-time IP enforcement
 
-- **Status:** Accepted. Amended 2026-11-09 for US-002: the package is `internal/library/netguard` ([ADR 0012](0012-google-wire-and-per-dependency-libraries.md)), and the registration rules and blocked ranges are extended in [`docs/plans/us-002.md`](../plans/us-002.md) section 3.
+- **Status:** Accepted. Amended 2026-11-09 for US-002: the package is `internal/library/netguard` ([ADR 0012](0012-google-wire-and-per-dependency-libraries.md)), and the registration rules and blocked ranges are extended in [`docs/plans/us-002.md`](../plans/us-002.md) section 3. Amended 2026-11-20 for US-010 by [ADR 0017](0017-demo-receiver-postgres-hit-counter-and-derived-allowlist.md): `OUTBOUND_ALLOWLIST` is removed, and the allowlist is derived as exactly `DEMO_RECEIVER_BASE_URL` when the demo receiver is enabled, or empty otherwise.
 - **Date:** 2026-11-08
 
 ## Context
@@ -28,8 +28,9 @@ A single policy in `internal/platform/netguard` is enforced in two places.
   `*.internal` or `*.local`. If the host is an IP literal it is checked directly. Otherwise it is
   resolved (2 s timeout) and **every** returned address must be public. Unresolvable hosts are
   rejected (`400`, field `url`).
-- URLs matching an entry in `OUTBOUND_ALLOWLIST` (exact scheme + host + port, plus a path
-  prefix) skip the production checks. By default the list holds only `DEMO_RECEIVER_BASE_URL`.
+- URLs matching an allowlist entry (exact scheme + host + port, plus a path
+  prefix) skip the production checks. The list holds only `DEMO_RECEIVER_BASE_URL` (since ADR 0017 it is
+  derived from it and cannot be configured).
 - Optional hardening for the public demo: `OUTBOUND_ALLOWLIST_ONLY=true` accepts *only*
   allowlisted URLs. This turns the shared demo key into a closed sandbox (see open questions in
   `docs/architecture.md`).

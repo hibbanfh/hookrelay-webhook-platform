@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 
+	demoentity "hookrelay/internal/demoreceiver/domain/entity"
+	demorepository "hookrelay/internal/demoreceiver/domain/repository"
 	dispatchentity "hookrelay/internal/dispatch/domain/entity"
 	dispatcherrors "hookrelay/internal/dispatch/domain/errors"
 	dispatchrepo "hookrelay/internal/dispatch/domain/repository"
@@ -15,9 +19,10 @@ import (
 	messageentity "hookrelay/internal/message/domain/entity"
 	messagerepository "hookrelay/internal/message/domain/repository"
 	messageuc "hookrelay/internal/message/domain/usecase"
+	"hookrelay/internal/platform/config"
 )
 
-// This file is the only place where three modules meet (ADR 0014 section 4). dispatch declares
+// This file is the only place where the modules meet (ADR 0014 section 4, ADR 0017 section 2). dispatch declares
 // the ports it needs, and message declares the one it reads deliveries through (ADR 0015); the
 // adapters below implement them by calling internal use cases of the other modules. No module
 // imports another.
@@ -146,4 +151,68 @@ func toMessageDelivery(d *dispatchentity.Delivery) messageentity.MessageDelivery
 		ID: d.ID, MessageID: d.MessageID, EndpointID: d.EndpointID, Status: string(d.Status), AttemptCount: d.AttemptCount,
 		NextAttemptAt: d.NextAttemptAt, LastAttemptAt: d.LastAttemptAt, CreatedAt: d.CreatedAt,
 	}
+}
+
+// demoSecretSource implements demoreceiver's SecretSource over the endpoint module (ADR 0017).
+type demoSecretSource struct {
+	list    *endpointuc.ListDemoSigningSecrets
+	baseURL string
+	log     *slog.Logger
+}
+
+// ProvideDemoSecretSource adapts the endpoint use case to the demoreceiver port. The base URL is
+// empty when the demo receiver is disabled, which makes the use case answer without a query.
+func ProvideDemoSecretSource(uc *endpointuc.ListDemoSigningSecrets, cfg config.Config, log *slog.Logger) demorepository.SecretSource {
+	return demoSecretSource{list: uc, baseURL: demoReceiverBaseURL(cfg), log: log}
+}
+
+// DemoSecrets lists the secrets of the project's demo endpoints: those whose URL is the project's
+// receiver URL, the same string GET /v1/project shows as demo_receiver_url. An unknown project and
+// a project without demo endpoints both give an empty slice.
+func (s demoSecretSource) DemoSecrets(ctx context.Context, projectID string) ([]demoentity.Candidate, error) {
+	batch, err := s.list.Execute(ctx, endpointuc.ListDemoSigningSecretsInput{ProjectID: projectID, ReceiverURL: s.receiverURL(projectID)})
+	if err != nil {
+		return nil, fmt.Errorf("read demo secrets: %w", err)
+	}
+	s.reportUnreadable(ctx, projectID, batch.Unreadable)
+	out := make([]demoentity.Candidate, 0, len(batch.Secrets))
+	for _, r := range batch.Secrets {
+		out = append(out, demoentity.Candidate{EndpointID: r.EndpointID, Key: demoentity.NewSigningKey(r.Secret.Bytes())})
+	}
+	return out, nil
+}
+
+// reportUnreadable tells the operator, once per request, that demo endpoints exist whose secret
+// cannot be opened (a botched key rotation). Their signatures can never verify, so the receiver
+// answers 401 for them and this line is the only trace of why. The causes name the key version
+// and the class of failure, never key material.
+func (s demoSecretSource) reportUnreadable(ctx context.Context, projectID string, unreadable []endpointrepository.UnreadableTarget) {
+	if len(unreadable) == 0 {
+		return
+	}
+	causes := make([]string, 0, len(unreadable))
+	for _, u := range unreadable {
+		causes = append(causes, u.ID+": "+u.Cause)
+	}
+	s.log.WarnContext(ctx, "demo endpoint secrets could not be opened",
+		slog.String("project_id", projectID), slog.Int("count", len(unreadable)), slog.String("endpoints", strings.Join(causes, "; ")))
+}
+
+func (s demoSecretSource) receiverURL(projectID string) string {
+	if s.baseURL == "" {
+		return ""
+	}
+	return config.DemoReceiverURL(s.baseURL, projectID)
+}
+
+// demoSigner implements demoreceiver's Signer with the function the worker signs with, so the
+// HMAC code exists once and the receiver verifies exactly what the worker sends.
+type demoSigner struct{}
+
+// ProvideDemoSigner returns the Signer over dispatch's Sign.
+func ProvideDemoSigner() demorepository.Signer { return demoSigner{} }
+
+// Sign returns "v1," + base64(HMAC-SHA256(key, "{id}.{ts}.{body}")).
+func (demoSigner) Sign(key []byte, webhookID string, ts int64, body []byte) string {
+	return dispatchentity.Sign(key, webhookID, ts, body)
 }

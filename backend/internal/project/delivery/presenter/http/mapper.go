@@ -35,6 +35,8 @@ func toCreatedResponse(p entity.Project, key entity.RawKey, demoBaseURL string) 
 	}
 }
 
+// demoReceiverURL must equal config.DemoReceiverURL, the one builder all callers use. A presenter
+// cannot import config, so demo_receiver_url_test.go pins the two together.
 func demoReceiverURL(baseURL, projectID string) *string {
 	if baseURL == "" {
 		return nil

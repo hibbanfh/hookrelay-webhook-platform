@@ -78,6 +78,8 @@ type sessAPI struct {
 	repo     *memRepo
 	ensurer  *fakeEnsurer
 	owners   *fakeOwnedRepo
+	// demoBaseURL is "" (the receiver is disabled) unless a test sets it before calling build.
+	demoBaseURL string
 }
 
 func newSessionAPI(t *testing.T) *sessAPI {
@@ -105,8 +107,8 @@ func (a *sessAPI) build() http.Handler {
 	resp := discardResponder()
 	deps := usecase.Deps{Projects: a.repo, IDs: &seqIDs{}, Clock: fixedClock{}, Random: &seqRandom{}}
 	sessions := usecase.NewAuthenticateSession(a.verifier)
-	h := httppresenter.NewHandler(usecase.NewCreateProject(deps, true), usecase.NewGetCurrentProject(a.repo), resp, "")
-	me := httppresenter.NewMeHandler(a.ensurer, resp, "")
+	h := httppresenter.NewHandler(usecase.NewCreateProject(deps, true), usecase.NewGetCurrentProject(a.repo), resp, a.demoBaseURL)
+	me := httppresenter.NewMeHandler(a.ensurer, resp, a.demoBaseURL)
 	guard := httppresenter.RequireProject(httppresenter.ProjectGuardDeps{
 		Keys:     usecase.NewAuthenticateAPIKey(a.repo),
 		Sessions: sessions,

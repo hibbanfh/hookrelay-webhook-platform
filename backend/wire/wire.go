@@ -26,7 +26,7 @@ var infra = wire.NewSet(
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchAPISet,
+	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchAPISet, DemoReceiverSet,
 	httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger,
 	wire.Struct(new(RouterDeps), "*"),
@@ -63,6 +63,6 @@ func InitializeRunner(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool, n
 
 // InitializeSeed builds the seed process.
 func InitializeSeed(ctx context.Context, cfg config.Config) (*Seed, func(), error) {
-	wire.Build(infra, CoreSet, ProjectSet, wire.Value(SeedProcess), wire.Value(SeedPoolSize), wire.Struct(new(Seed), "*"))
+	wire.Build(infra, CoreSet, ProjectSet, EndpointSet, wire.Value(SeedProcess), wire.Value(SeedPoolSize), wire.Struct(new(Seed), "*"))
 	return nil, nil, nil
 }

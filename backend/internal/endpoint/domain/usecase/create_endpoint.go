@@ -62,7 +62,13 @@ func (u *CreateEndpoint) Execute(ctx context.Context, in CreateEndpointInput) (C
 }
 
 func (u *CreateEndpoint) newSecret() (entity.SigningSecret, error) {
-	entropy, err := u.deps.Random.Bytes(entity.SigningSecretEntropyBytes)
+	return newSigningSecret(u.deps.Random)
+}
+
+// newSigningSecret draws a fresh secret from the entropy source. CreateEndpoint and
+// SeedDemoEndpoints both use it.
+func newSigningSecret(random RandomSource) (entity.SigningSecret, error) {
+	entropy, err := random.Bytes(entity.SigningSecretEntropyBytes)
 	if err != nil {
 		return entity.SigningSecret{}, fmt.Errorf("generate signing secret: %w", err)
 	}

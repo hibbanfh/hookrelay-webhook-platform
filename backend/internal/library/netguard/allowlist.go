@@ -5,7 +5,8 @@ import (
 	"strings"
 )
 
-// allowEntry is one OUTBOUND_ALLOWLIST item: exact scheme, host and port, and a path prefix.
+// allowEntry is one allowlist item (the server derives the list from DEMO_RECEIVER_BASE_URL): exact
+// scheme, host and port, and a path prefix.
 type allowEntry struct {
 	scheme string
 	host   string
@@ -41,7 +42,7 @@ func portOf(u *url.URL) string {
 
 func (p *Policy) matchesAllowlist(u *url.URL) bool {
 	host, ok := normalizeHost(u.Hostname())
-	if !ok || hasDotSegment(u.Path) {
+	if !ok || u.User != nil || hasDotSegment(u.Path) {
 		return false
 	}
 	for _, e := range p.allowlist {

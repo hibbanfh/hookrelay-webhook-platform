@@ -487,6 +487,104 @@ linters:
             - {pkg: hookrelay/internal/platform, desc: "the worker must not import platform"}
             - {pkg: hookrelay/internal/dispatch/data, desc: "delivery must not import data"}
             - {pkg: hookrelay/internal/dispatch/domain/repository, desc: "the worker calls use cases, not repository ports"}
+        # --- domain/errors: stdlib only ---------------------------------------------
+        demoreceiver-domain-errors:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/domain/errors/**", "!$test"]
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "domain/errors imports nothing from this repo"}
+        # --- domain/entity: stdlib + domain/errors ----------------------------------
+        demoreceiver-domain-entity:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/domain/entity/**", "!$test"]
+          allow:
+            - hookrelay/internal/demoreceiver/domain/errors
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "entity imports domain/errors only"}
+        # --- domain/repository: ports over entity + errors --------------------------
+        demoreceiver-domain-repository:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/domain/repository/**", "!$test"]
+          allow:
+            - hookrelay/internal/demoreceiver/domain/entity
+            - hookrelay/internal/demoreceiver/domain/errors
+          deny:
+            - {pkg: net/http, desc: "domain must not depend on net/http"}
+            - {pkg: log/slog, desc: "domain must not log"}
+            - {pkg: github.com, desc: "domain imports the stdlib only"}
+            - {pkg: golang.org, desc: "domain imports the stdlib only"}
+            - {pkg: hookrelay, desc: "repository ports import entity and errors only"}
+        # --- domain/usecase: application rules over domain/* ------------------------
+        demoreceiver-domain-usecase:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/domain/usecase/**", "!$test"]
+          allow:
+            - hookrelay/internal/demoreceiver/domain/entity
+            - hookrelay/internal/demoreceiver/domain/errors
+            - hookrelay/internal/demoreceiver/domain/repository
+          deny:
+            - {pkg: net/http, desc: "use cases must not know HTTP"}
+            - {pkg: github.com, desc: "use cases must not know pgx or other third-party adapters"}
+            - {pkg: golang.org, desc: "use cases import the stdlib and domain/* only"}
+            - {pkg: hookrelay, desc: "use cases import domain/* only (not data, delivery or platform)"}
+        # --- data/model: plain row structs ------------------------------------------
+        demoreceiver-data-model:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/data/model/**", "!$test"]
+          deny:
+            - {pkg: github.com, desc: "models are plain structs"}
+            - {pkg: golang.org, desc: "models are plain structs"}
+            - {pkg: hookrelay, desc: "models import nothing from this repo"}
+        # --- data/source: SQL + pgx, returns models ---------------------------------
+        demoreceiver-data-source:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/data/source/**", "!$test"]
+          allow:
+            - hookrelay/internal/library/postgres
+          deny:
+            - {pkg: hookrelay/internal/demoreceiver/domain, desc: "sources return models, not entities"}
+            - {pkg: hookrelay/internal/demoreceiver/delivery, desc: "data must not import delivery"}
+            - {pkg: hookrelay/internal/demoreceiver/data/repository, desc: "sources do not know repositories"}
+            - {pkg: hookrelay/internal/platform, desc: "sources reach the database through library/postgres only"}
+            - {pkg: hookrelay/internal/library, desc: "sources may import library/postgres only"}
+        # --- data/repository: models <-> entities, no SQL ---------------------------
+        demoreceiver-data-repository:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/data/repository/**", "!$test"]
+          deny:
+            - {pkg: github.com/jackc, desc: "SQL and pgx belong to data/source"}
+            - {pkg: net/http, desc: "repositories must not know HTTP"}
+            - {pkg: hookrelay/internal/demoreceiver/delivery, desc: "data must not import delivery"}
+            - {pkg: hookrelay/internal/demoreceiver/domain/usecase, desc: "data must not import use cases"}
+            - {pkg: hookrelay/internal/platform, desc: "repositories reach storage through data/source"}
+            - {pkg: hookrelay/internal/library, desc: "repositories reach storage through data/source"}
+        # --- delivery/dto: plain request/response structs ---------------------------
+        demoreceiver-delivery-dto:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/delivery/dto/**", "!$test"]
+          allow:
+            - hookrelay/internal/demoreceiver/domain/entity
+          deny:
+            - {pkg: net/http, desc: "DTOs are plain structs"}
+            - {pkg: github.com, desc: "DTOs are plain structs"}
+            - {pkg: hookrelay, desc: "DTOs import domain/entity at most"}
+        # --- delivery/presenter/http: handlers over use cases -----------------------
+        demoreceiver-delivery-presenter:
+          list-mode: lax
+          files: ["**/internal/demoreceiver/delivery/presenter/**", "!$test"]
+          deny:
+            - {pkg: github.com/jackc, desc: "delivery must not touch the database"}
+            - {pkg: hookrelay/internal/library, desc: "delivery must not touch libraries or the database"}
+            - {pkg: hookrelay/internal/demoreceiver/data, desc: "delivery must not import data"}
+            - {pkg: hookrelay/internal/demoreceiver/domain/repository, desc: "delivery calls use cases, not repository ports"}
         # --- nothing but cmd/server imports data or presenter -----------------------
         no-importing-presenter:
           list-mode: lax
@@ -496,6 +594,7 @@ linters:
             - {pkg: hookrelay/internal/endpoint/delivery/presenter, desc: "only the composition root imports presenters"}
             - {pkg: hookrelay/internal/message/delivery/presenter, desc: "only the composition root imports presenters"}
             - {pkg: hookrelay/internal/dispatch/delivery/presenter, desc: "only the composition root imports presenters"}
+            - {pkg: hookrelay/internal/demoreceiver/delivery/presenter, desc: "only the composition root imports presenters"}
         no-importing-project-data:
           list-mode: lax
           files: ["**/internal/**", "!**/internal/project/data/**", "!$test"]
@@ -516,6 +615,11 @@ linters:
           files: ["**/internal/**", "!**/internal/dispatch/data/**", "!$test"]
           deny:
             - {pkg: hookrelay/internal/dispatch/data, desc: "only the composition root (and data itself) imports data"}
+        no-importing-demoreceiver-data:
+          list-mode: lax
+          files: ["**/internal/**", "!**/internal/demoreceiver/data/**", "!$test"]
+          deny:
+            - {pkg: hookrelay/internal/demoreceiver/data, desc: "only the composition root (and data itself) imports data"}
         # --- nothing under internal imports the composition root or Wire ------------
         no-importing-wire:
           list-mode: lax

@@ -62,6 +62,7 @@ var EndpointSet = wire.NewSet(
 
 	endpointrepo.NewEndpointRepository,
 	endpointrepo.NewSecretReader,
+	endpointrepo.NewEndpointURLLister,
 
 	wire.Struct(new(endpointuc.CreateEndpointDeps), "*"),
 	ProvideCreateEndpoint,
@@ -69,6 +70,9 @@ var EndpointSet = wire.NewSet(
 	endpointuc.NewGetEndpoint,
 	endpointuc.NewGetEndpointSecret,
 	endpointuc.NewUpdateEndpoint,
+	endpointuc.NewListDemoSigningSecrets,
+	wire.Struct(new(endpointuc.SeedDemoEndpointsDeps), "*"),
+	ProvideSeedDemoEndpoints,
 	wire.Struct(new(EndpointUseCases), "*"),
 	ProvideEndpointHandler,
 	wire.Struct(new(EndpointRoutes), "*"),
@@ -82,6 +86,11 @@ func ProvideEndpointSource(pool *pgxpool.Pool) *endpointsource.EndpointPersisten
 // ProvideCreateEndpoint builds the use case with the MAX_ENDPOINTS_PER_PROJECT limit.
 func ProvideCreateEndpoint(deps endpointuc.CreateEndpointDeps, cfg config.Config) *endpointuc.CreateEndpoint {
 	return endpointuc.NewCreateEndpoint(deps, cfg.MaxEndpointsPerProject)
+}
+
+// ProvideSeedDemoEndpoints builds the internal seed use case with the MAX_ENDPOINTS_PER_PROJECT limit.
+func ProvideSeedDemoEndpoints(deps endpointuc.SeedDemoEndpointsDeps, cfg config.Config) *endpointuc.SeedDemoEndpoints {
+	return endpointuc.NewSeedDemoEndpoints(deps, cfg.MaxEndpointsPerProject)
 }
 
 // EndpointUseCases groups the five endpoint use cases for the handler provider.

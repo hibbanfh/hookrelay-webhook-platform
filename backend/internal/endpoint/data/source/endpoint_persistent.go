@@ -63,6 +63,20 @@ const lockProjectSQL = `SELECT id FROM projects WHERE id = $1 FOR NO KEY UPDATE`
 
 const countEndpointsSQL = `SELECT count(*) FROM endpoints WHERE project_id = $1`
 
+// listDemoSecretsSQL finds the demo endpoints of one project: the receiver URL itself, or the
+// URL followed by a query. endpoints_project_created_idx narrows it to the project (at most
+// MAX_ENDPOINTS_PER_PROJECT rows). starts_with is used instead of LIKE because project IDs
+// contain "_", which is a LIKE wildcard.
+const listDemoSecretsSQL = `
+SELECT id, secret_ciphertext, secret_key_version
+FROM endpoints
+WHERE project_id = $1 AND (url = $2 OR starts_with(url, $2::text || '?'))
+ORDER BY created_at, id
+LIMIT $3`
+
+// listURLsSQL runs inside the seed transaction, after the project row lock.
+const listURLsSQL = `SELECT url FROM endpoints WHERE project_id = $1`
+
 // ListParams selects one page. HasAfter says whether AfterCreatedAt and AfterID are set.
 type ListParams struct {
 	ProjectID      string
@@ -98,6 +112,11 @@ type EndpointPersistent interface {
 	LockProject(ctx context.Context, projectID string) error
 	// CountByProject returns how many endpoints the project has.
 	CountByProject(ctx context.Context, projectID string) (int, error)
+	// ListSealedDemoSecrets returns the sealed secrets of the project's endpoints whose url equals
+	// receiverURL or starts with receiverURL + "?", oldest first, at most limit.
+	ListSealedDemoSecrets(ctx context.Context, projectID, receiverURL string, limit int) ([]model.SealedSecret, error)
+	// ListURLs returns the URL of every endpoint of the project.
+	ListURLs(ctx context.Context, projectID string) ([]string, error)
 }
 
 // EndpointPersistentImpl implements EndpointPersistent on PostgreSQL.
@@ -201,6 +220,34 @@ func (s *EndpointPersistentImpl) CountByProject(ctx context.Context, projectID s
 	return n, nil
 }
 
+// ListSealedDemoSecrets reads the sealed secrets of the demo endpoints in one statement.
+func (s *EndpointPersistentImpl) ListSealedDemoSecrets(ctx context.Context, projectID, receiverURL string, limit int) ([]model.SealedSecret, error) {
+	rows, err := postgres.Executor(ctx, s.db).Query(ctx, listDemoSecretsSQL, projectID, receiverURL, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query demo secrets: %w", err)
+	}
+	defer rows.Close()
+	out, err := pgx.CollectRows(rows, scanSealedSecret)
+	if err != nil {
+		return nil, fmt.Errorf("read demo secrets: %w", err)
+	}
+	return out, nil
+}
+
+// ListURLs reads every URL of the project. It joins the transaction carried by ctx.
+func (s *EndpointPersistentImpl) ListURLs(ctx context.Context, projectID string) ([]string, error) {
+	rows, err := postgres.Executor(ctx, s.db).Query(ctx, listURLsSQL, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("query endpoint urls: %w", err)
+	}
+	defer rows.Close()
+	out, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("read endpoint urls: %w", err)
+	}
+	return out, nil
+}
+
 func scanEndpoint(row pgx.Row) (model.Endpoint, error) {
 	var m model.Endpoint
 	err := row.Scan(&m.ID, &m.ProjectID, &m.URL, &m.Description, &m.Enabled, &m.CreatedAt, &m.UpdatedAt)
@@ -222,5 +269,11 @@ func scanCollectable(row pgx.CollectableRow) (model.Endpoint, error) {
 func scanSealedTarget(row pgx.CollectableRow) (model.SealedTarget, error) {
 	var m model.SealedTarget
 	err := row.Scan(&m.ID, &m.ProjectID, &m.URL, &m.Enabled, &m.Ciphertext, &m.KeyVersion)
+	return m, err
+}
+
+func scanSealedSecret(row pgx.CollectableRow) (model.SealedSecret, error) {
+	var m model.SealedSecret
+	err := row.Scan(&m.EndpointID, &m.Ciphertext, &m.KeyVersion)
 	return m, err
 }

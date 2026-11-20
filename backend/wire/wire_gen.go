@@ -10,6 +10,8 @@ import (
 	"context"
 	"github.com/google/wire"
 	"github.com/jackc/pgx/v5/pgxpool"
+	repositoryimpl5 "hookrelay/internal/demoreceiver/data/repository"
+	usecase5 "hookrelay/internal/demoreceiver/domain/usecase"
 	repositoryimpl4 "hookrelay/internal/dispatch/data/repository"
 	"hookrelay/internal/dispatch/delivery/worker"
 	usecase4 "hookrelay/internal/dispatch/domain/usecase"
@@ -175,6 +177,15 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Handler: handler3,
 		Guard:   projectGuard,
 	}
+	listDemoSigningSecrets := usecase2.NewListDemoSigningSecrets(secretReader)
+	secretSource := ProvideDemoSecretSource(listDemoSigningSecrets, cfg, slogLogger)
+	signer := ProvideDemoSigner()
+	hitPersistentImpl := ProvideHitSource(pool)
+	hitCounter := repositoryimpl5.NewHitCounter(hitPersistentImpl, slogLogger)
+	clock5 := ProvideDemoReceiverClock(system)
+	receiveWebhook := usecase5.NewReceiveWebhook(secretSource, signer, hitCounter, clock5)
+	handler4 := ProvideDemoReceiverHandler(receiveWebhook, responder)
+	demoReceiverRoutes := ProvideDemoReceiverRoutes(handler4, cfg)
 	routerDeps := RouterDeps{
 		Config:   cfg,
 		Log:      slogLogger,
@@ -185,6 +196,7 @@ func InitializeAPI(ctx context.Context, cfg config.Config) (*API, func(), error)
 		Endpoint: endpointRoutes,
 		Message:  messageRoutes,
 		Dispatch: dispatchRoutes,
+		Demo:     demoReceiverRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	api := &API{
@@ -329,6 +341,15 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Handler: handler3,
 		Guard:   projectGuard,
 	}
+	listDemoSigningSecrets := usecase2.NewListDemoSigningSecrets(secretReader)
+	secretSource := ProvideDemoSecretSource(listDemoSigningSecrets, cfg, log)
+	signer := ProvideDemoSigner()
+	hitPersistentImpl := ProvideHitSource(pool)
+	hitCounter := repositoryimpl5.NewHitCounter(hitPersistentImpl, log)
+	clock5 := ProvideDemoReceiverClock(system)
+	receiveWebhook := usecase5.NewReceiveWebhook(secretSource, signer, hitCounter, clock5)
+	handler4 := ProvideDemoReceiverHandler(receiveWebhook, responder)
+	demoReceiverRoutes := ProvideDemoReceiverRoutes(handler4, cfg)
 	routerDeps := RouterDeps{
 		Config:   cfg,
 		Log:      log,
@@ -339,6 +360,7 @@ func InitializeRouter(cfg config.Config, log *slog.Logger, pool *pgxpool.Pool) (
 		Endpoint: endpointRoutes,
 		Message:  messageRoutes,
 		Dispatch: dispatchRoutes,
+		Demo:     demoReceiverRoutes,
 	}
 	httpHandler := NewRouter(routerDeps)
 	return httpHandler, nil
@@ -531,12 +553,46 @@ func InitializeSeed(ctx context.Context, cfg config.Config) (*Seed, func(), erro
 		Random:   randomSource,
 	}
 	seedDemoProject := usecase.NewSeedDemoProject(deps)
+	endpointPersistentImpl := ProvideEndpointSource(pool)
+	secretboxOptions := SecretboxOptions(cfg)
+	box, err := secretbox.New(secretboxOptions)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	endpointRepository := repositoryimpl2.NewEndpointRepository(endpointPersistentImpl, box)
+	netguardOptions := NetguardOptions(cfg)
+	policy, err := netguard.New(netguardOptions)
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	usecaseIDGenerator := ProvideEndpointIDs(generator)
+	clock2 := ProvideEndpointClock(system)
+	usecaseRandomSource := ProvideEndpointRandom(crypto)
+	txManager := postgres.NewTxManager(pool)
+	usecaseTxManager := ProvideEndpointTx(txManager)
+	createEndpointDeps := usecase2.CreateEndpointDeps{
+		Endpoints: endpointRepository,
+		Policy:    policy,
+		IDs:       usecaseIDGenerator,
+		Clock:     clock2,
+		Random:    usecaseRandomSource,
+		Tx:        usecaseTxManager,
+	}
+	endpointURLLister := repositoryimpl2.NewEndpointURLLister(endpointPersistentImpl)
+	seedDemoEndpointsDeps := usecase2.SeedDemoEndpointsDeps{
+		CreateEndpointDeps: createEndpointDeps,
+		URLs:               endpointURLLister,
+	}
+	seedDemoEndpoints := ProvideSeedDemoEndpoints(seedDemoEndpointsDeps, cfg)
 	processName := _wireProcessNameValue2
 	loggerOptions := LoggerOptions(cfg, processName)
 	slogLogger := logger.Provide(loggerOptions)
 	seed := &Seed{
-		DemoProject: seedDemoProject,
-		Log:         slogLogger,
+		DemoProject:   seedDemoProject,
+		DemoEndpoints: seedDemoEndpoints,
+		Log:           slogLogger,
 	}
 	return seed, func() {
 		cleanup()
@@ -555,7 +611,7 @@ var infra = wire.NewSet(logger.ProviderSet, LoggerOptions, postgres.ProviderSet,
 
 // routerSet is the API graph below the logger and the pool, shared by the real API and the tests.
 var routerSet = wire.NewSet(
-	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchAPISet, httpclient.ProviderSet, HTTPClientOptions,
+	CoreSet, ProjectSet, EndpointSet, MessageSet, DispatchAPISet, DemoReceiverSet, httpclient.ProviderSet, HTTPClientOptions,
 	ProvidePinger, wire.Struct(new(RouterDeps), "*"), NewRouter,
 )
 

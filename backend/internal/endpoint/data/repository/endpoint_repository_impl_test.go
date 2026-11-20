@@ -33,6 +33,12 @@ type fakeSource struct {
 	targets    []model.SealedTarget
 	targetsErr error
 
+	demoSecrets []model.SealedSecret
+	demoErr     error
+	gotDemo     demoCall
+	urls        []string
+	urlsErr     error
+
 	insertErr, getErr, secretErr, listErr, updateErr, lockErr, countErr error
 	count                                                               int
 }
@@ -53,6 +59,19 @@ func (f *fakeSource) GetSecretByID(context.Context, string, string) (model.Endpo
 func (f *fakeSource) GetSealedTargets(context.Context, []string) ([]model.SealedTarget, error) {
 	return f.targets, f.targetsErr
 }
+
+// demoCall is what ListSealedDemoSecrets was asked for.
+type demoCall struct {
+	projectID, receiverURL string
+	limit                  int
+}
+
+func (f *fakeSource) ListSealedDemoSecrets(_ context.Context, projectID, receiverURL string, limit int) ([]model.SealedSecret, error) {
+	f.gotDemo = demoCall{projectID: projectID, receiverURL: receiverURL, limit: limit}
+	return f.demoSecrets, f.demoErr
+}
+
+func (f *fakeSource) ListURLs(context.Context, string) ([]string, error) { return f.urls, f.urlsErr }
 
 func (f *fakeSource) List(_ context.Context, p source.ListParams) ([]model.Endpoint, error) {
 	f.gotList = p

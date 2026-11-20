@@ -81,6 +81,17 @@ type fakeSecrets struct {
 	secret entity.SigningSecret
 	err    error
 	gotID  string
+
+	demoRows  repository.DemoSecretBatch
+	demoErr   error
+	demoCalls int
+	gotDemo   repository.DemoSecretQuery
+}
+
+func (f *fakeSecrets) ListDemoSecrets(_ context.Context, q repository.DemoSecretQuery) (repository.DemoSecretBatch, error) {
+	f.demoCalls++
+	f.gotDemo = q
+	return f.demoRows, f.demoErr
 }
 
 func (f *fakeSecrets) GetSecret(_ context.Context, _, id string) (entity.SigningSecret, error) {

@@ -403,7 +403,7 @@ Notes / out of scope:
 
 ---
 
-### US-010: Built-in demo receiver with failure simulation            [status: todo]  [priority: P0]
+### US-010: Built-in demo receiver with failure simulation            [status: done]  [priority: P0]
 As a portfolio reviewer, I want a ready-made receiver URL that can be told to fail, so that
 I can watch retries and replay work in the live demo without running my own server.
 
@@ -496,6 +496,11 @@ Acceptance criteria:
   succeed and the rest get `429` with code `rate_limited` and a `Retry-After` header.
 - Given two keys, when one is rate-limited, then the other is unaffected.
 - Given several API instances, then the limit applies across all of them (shared state).
+
+Note (US-010): the public demo receiver (`POST /demo/receiver/{project_id}`) is unauthenticated. Every request
+that reaches the signature check costs one indexed read on the API's database pool (max 10 connections), so a
+flood of unsigned requests can use up those connections and slow the real API. This story's limiter must cover
+that route too (per IP, since there is no key).
 
 ### US-013: Manage API keys (multiple keys, revoke)            [status: todo]  [priority: P1]
 As a platform developer, I want to create additional API keys and revoke old ones, so that
@@ -636,3 +641,11 @@ multi-language SDKs. See `docs/PRD.md` section 5.
 - **Impact:** any slow or broken client or a network drop mid-upload counts as a server error in the 5xx metric and alerts, and makes the API look unhealthy. Publish is the highest-traffic route, so it is the one that matters.
 - **Cause:** `httpx.ReadBody` wraps every `io.ReadAll` error with `%w`. Only `*http.MaxBytesError` is recognised by `Responder.Error`, so a read timeout or a connection reset falls through to the generic 500. The streaming `DecodeJSON` used by the other routes turns the same error into a 400.
 - **Suspected area:** `backend/internal/platform/httpx/body.go` (map any non-`MaxBytesError` read failure to a 400 with `CodeValidation`/"could not read request body", logged at INFO/WARN), plus a `body_test.go` row with a reader that returns `os.ErrDeadlineExceeded`.
+
+### BUG-QA-015: `fail_first` above 10 or below 0 loses to the body limit on the demo receiver (US-010)   [minor] - FIXED
+- **Steps:** `POST /demo/receiver/{project_id}?fail_first=99` with a body of 262145 bytes (and any headers).
+- **Expected (openapi `demoReceive` "Order of checks", plan section 2):** `400 validation_error`, field `fail_first` (step 2 comes before the 413 of step 3). **Actual:** `413 payload_too_large`. A non-integer or repeated `fail_first` does give the 400 first, so only the range is late.
+- **Cause:** the integer parse and the "sent once" rule are in the handler (before `httpx.ReadBody`), but the 0..10 range lives in `entity.NewFailurePlan`, which the use case runs after the body is read.
+- **Impact:** cosmetic. Both answers are 4xx and nothing is counted. Either move the range check ahead of `ReadBody` or reword the openapi order ("an integer, sent once; the range is checked after the body").
+- **Suspected area:** `internal/demoreceiver/delivery/presenter/http/receive_webhook_handler.go` or `api/openapi.yaml` `demoReceive`.
+- **Status: fixed.** The handler builds the plan with `entity.NewFailurePlan` before `httpx.ReadBody` and hands the validated plan to the use case, so a bad `fail_first` is a 400 before the 413 (an integer overflow gets the same range message). Pinned by `backend/wire/demoreceiver_qa_integration_test.go`, case "oversized with an out-of-range fail_first is a 400 first (BUG-QA-015)", and by handler tests.

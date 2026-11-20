@@ -99,8 +99,11 @@ export interface paths {
          * @description Validation: `url` must be an absolute `http(s)` URL of at most 2048 characters with no embedded
          *     credentials; `description` at most 255 characters and never `null`. In production mode the URL must be
          *     `https://` and its host must not be, or resolve to, a loopback, private (RFC 1918), link-local
-         *     (incl. `169.254.169.254`), CGNAT, unique-local IPv6 or other non-public address, unless it matches the
-         *     operator allowlist (the built-in demo receiver). A hostname that cannot be resolved (no records, DNS
+         *     (incl. `169.254.169.254`), CGNAT, unique-local IPv6 or other non-public address. The single exception is the
+         *     built-in demo receiver (`Project.demo_receiver_url`, ADR 0017): a URL with exactly its scheme, host and port
+         *     and a path under its base path (no `.`/`..` segments) skips these rules. Other paths or ports on the same host
+         *     do not. A deployment may also accept *only* demo receiver URLs (`OUTBOUND_ALLOWLIST_ONLY`), in which case any
+         *     other URL returns `400`. A hostname that cannot be resolved (no records, DNS
          *     error or timeout) is rejected with `400 validation_error`, field `url`. Registration makes no HTTP call
          *     to the URL.
          *
@@ -356,7 +359,11 @@ export interface paths {
             query?: never;
             header?: never;
             path: {
-                /** @description The project whose demo endpoints may be sending to this URL. */
+                /**
+                 * @description The project whose demo endpoints may be sending to this URL. A value that is not a well-formed project ID
+                 *     returns `404 not_found`. A well-formed but unknown project returns the same `401` as a bad signature, so
+                 *     the response never says whether a project exists.
+                 */
                 project_id: components["schemas"]["ProjectID"];
             };
             cookie?: never;
@@ -365,16 +372,36 @@ export interface paths {
         put?: never;
         /**
          * Built-in demo receiver that verifies signatures and can fail on purpose
-         * @description A receiver for demos and E2E tests, hosted by the API process. Register
-         *     `{demo_receiver_url}?fail_first=N` (see `Project.demo_receiver_url`) as an endpoint URL.
+         * @description A receiver for demos and E2E tests, hosted by the API process (ADR 0017). Register `demo_receiver_url`
+         *     (see `Project.demo_receiver_url`) as an endpoint URL, either exactly as given or followed by `?fail_first=N`.
+         *     `hookrelay seed` creates two such endpoints in the demo project: a healthy one and one with `?fail_first=2`.
          *
-         *     1. Verifies the Standard Webhooks signature against the signing secrets of this project's endpoints whose
-         *        URL points at this receiver. Invalid, missing or stale (more than 5 minutes) signatures return `401`.
-         *     2. Counts requests per (endpoint, `webhook-id`). The first `fail_first` requests return `500`; later ones
-         *        return `200`. Retries and replays of the same message therefore succeed once the count is exceeded.
+         *     **Not authenticated with an API key:** the Standard Webhooks signature is the credential. Only registered when
+         *     `DEMO_RECEIVER_ENABLED=true`; otherwise every request gets `404 not_found` ("route not found").
          *
-         *     Not authenticated with an API key; it is the target of signed webhooks. Only enabled when
-         *     `DEMO_RECEIVER_ENABLED=true`, otherwise `404`.
+         *     **Order of checks** (the first failure wins):
+         *     1. `project_id` well formed, else `404`.
+         *     2. `fail_first` an integer from 0 to 10, sent at most once, else `400 validation_error` (field `fail_first`).
+         *     3. Body at most 256 KB (`MAX_BODY_BYTES`), else `413`. The body is treated as raw bytes and never parsed, so any
+         *        content (also non-JSON or empty) is accepted if it is signed. `Content-Type` is ignored.
+         *     4. Exactly one `webhook-id`, `webhook-timestamp` and `webhook-signature` header, well formed, else `401`.
+         *     5. `webhook-timestamp` within 5 minutes of the server clock in either direction, else `401` with the message
+         *        "webhook timestamp is outside the 5 minute tolerance".
+         *     6. At least one `v1` signature in `webhook-signature` matches (constant-time compare) the HMAC computed with
+         *        the signing secret of one of this project's **demo endpoints**: endpoints whose `url` is exactly
+         *        `demo_receiver_url`, or `demo_receiver_url` followed by `?` and a query string. Otherwise `401`
+         *        "invalid webhook signature". That includes an unknown project and a project with no demo endpoints. The
+         *        endpoint whose secret matched is the one the request is counted for.
+         *     7. The request is counted per (endpoint, `webhook-id`). **Only requests that passed step 6 are counted.** If
+         *        the count is at most `fail_first`, the answer is `500 simulated_failure` ("request n of N"); otherwise `200`.
+         *
+         *     Retries and replays of a message reuse its `webhook-id`, so with `fail_first=2` and the default retry schedule
+         *     a delivery shows two failed attempts (about 5 s and 30 s apart) and then a success. Each demo endpoint counts on
+         *     its own, so one message fanned out to a healthy and a flaky demo endpoint succeeds at once on the first and on
+         *     the third attempt on the second. A count that has been idle for more than 7 days starts again from 1.
+         *
+         *     The response bodies below are stored as the attempt's response body (first 4 KB) and contain only IDs and
+         *     counters. No rate limit applies yet (US-012). A request that fails at step 6 or earlier writes nothing.
          */
         post: operations["demoReceive"];
         delete?: never;
@@ -429,7 +456,11 @@ export interface webhooks {
                     "webhook-id": components["parameters"]["WebhookIDHeader"];
                     /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
                     "webhook-timestamp": components["parameters"]["WebhookTimestampHeader"];
-                    /** @description Space-separated list of `v1,<base64 signature>`. */
+                    /**
+                     * @description Space-separated list of `v1,<base64 signature>`. Hookrelay sends one (two during secret rotation, US-011). The
+                     *     demo receiver ignores entries of other versions (for example `v1a,...`), accepts at most 10 entries, and
+                     *     succeeds if any `v1` entry matches.
+                     */
                     "webhook-signature": components["parameters"]["WebhookSignatureHeader"];
                     /** @description Identifies Hookrelay. Always starts with `Hookrelay/` followed by the build version. */
                     "User-Agent": string;
@@ -530,8 +561,12 @@ export interface components {
             created_at: components["schemas"]["Timestamp"];
             /**
              * Format: uri
-             * @description Base URL of the built-in demo receiver for this project (append `?fail_first=N`), or `null` when the
-             *     demo receiver is disabled on this deployment.
+             * @description URL of the built-in demo receiver for this project (`{DEMO_RECEIVER_BASE_URL}/{project_id}`), or `null`
+             *     when the demo receiver is disabled on this deployment. Register it as an endpoint URL **verbatim**, or with
+             *     `?fail_first=N` appended. The receiver only recognises endpoints whose URL is exactly one of these two forms
+             *     (another spelling of the same URL gets `401`). In production it is the only private destination the SSRF
+             *     guard allows. In local docker compose it is `http://api:8080/...`, which the worker can reach but a browser
+             *     cannot; that is expected.
              * @example https://hookrelay.fly.dev/demo/receiver/proj_01JC3ZK6Q8V2W7T4N5R9XBYH0M
              */
             demo_receiver_url: string | null;
@@ -709,10 +744,17 @@ export interface components {
         DemoReceiverResult: {
             /** @constant */
             received: true;
+            /** @description The demo endpoint whose signing secret verified the request. */
             endpoint_id: components["schemas"]["EndpointID"];
-            webhook_id: components["schemas"]["MessageID"];
-            /** @description How many times this (endpoint, webhook-id) pair has hit the receiver, including this request. */
+            /** @description The `webhook-id` header as received (the message ID when Hookrelay sent it). */
+            webhook_id: string;
+            /**
+             * @description How many signed requests this (endpoint, webhook-id) pair has made to the receiver, including this one.
+             *     Requests rejected with `401` are not counted. Starts again from 1 after 7 days without a request.
+             */
             request_number: number;
+            /** @description The `fail_first` value of this request (0 when absent). Always less than `request_number`. */
+            fail_first: number;
         };
     };
     responses: {
@@ -736,8 +778,8 @@ export interface components {
         };
         /**
          * @description No credential, both credentials, or a malformed, unknown, revoked, expired or signed-out API key or
-         *     session. The body is identical in every case (the message is kept from US-001 for compatibility). Also
-         *     returned for an invalid webhook signature on the demo receiver.
+         *     session. The body is identical in every case (the message is kept from US-001 for compatibility). The demo
+         *     receiver has its own 401 bodies (see `demoReceive`).
          */
         Unauthorized: {
             headers: {
@@ -936,9 +978,19 @@ export interface components {
         IdempotencyKey: string;
         /** @description The message ID. Stable across retries and replays. */
         WebhookIDHeader: components["schemas"]["MessageID"];
+        /**
+         * @description The Standard Webhooks message id. Hookrelay sends the message ID (`msg_...`), but the demo receiver accepts
+         *     any id of 1 to 255 printable ASCII characters (`!` to `~`), because it only stores ids whose signature verified.
+         * @example msg_01JC3ZP4A5B6C7D8E9F0G1H2J3
+         */
+        DemoWebhookIDHeader: string;
         /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
         WebhookTimestampHeader: string;
-        /** @description Space-separated list of `v1,<base64 signature>`. */
+        /**
+         * @description Space-separated list of `v1,<base64 signature>`. Hookrelay sends one (two during secret rotation, US-011). The
+         *     demo receiver ignores entries of other versions (for example `v1a,...`), accepts at most 10 entries, and
+         *     succeeds if any `v1` entry matches.
+         */
         WebhookSignatureHeader: string;
     };
     requestBodies: never;
@@ -1525,46 +1577,73 @@ export interface operations {
     demoReceive: {
         parameters: {
             query?: {
-                /** @description Number of initial requests per webhook-id to answer with 500. */
+                /**
+                 * @description Number of initial requests per (endpoint, webhook-id) to answer with `500 simulated_failure`. `0` (the default)
+                 *     never fails. Values 6 and above make every automatic attempt of the default schedule fail, so only a manual
+                 *     replay can succeed.
+                 */
                 fail_first?: number;
             };
             header: {
-                /** @description The message ID. Stable across retries and replays. */
-                "webhook-id": components["parameters"]["WebhookIDHeader"];
+                /**
+                 * @description The Standard Webhooks message id. Hookrelay sends the message ID (`msg_...`), but the demo receiver accepts
+                 *     any id of 1 to 255 printable ASCII characters (`!` to `~`), because it only stores ids whose signature verified.
+                 * @example msg_01JC3ZP4A5B6C7D8E9F0G1H2J3
+                 */
+                "webhook-id": components["parameters"]["DemoWebhookIDHeader"];
                 /** @description Unix seconds at send time (fresh for every attempt, so a retry or replay carries a new timestamp and a new signature). */
                 "webhook-timestamp": components["parameters"]["WebhookTimestampHeader"];
-                /** @description Space-separated list of `v1,<base64 signature>`. */
+                /**
+                 * @description Space-separated list of `v1,<base64 signature>`. Hookrelay sends one (two during secret rotation, US-011). The
+                 *     demo receiver ignores entries of other versions (for example `v1a,...`), accepts at most 10 entries, and
+                 *     succeeds if any `v1` entry matches.
+                 */
                 "webhook-signature": components["parameters"]["WebhookSignatureHeader"];
             };
             path: {
-                /** @description The project whose demo endpoints may be sending to this URL. */
+                /**
+                 * @description The project whose demo endpoints may be sending to this URL. A value that is not a well-formed project ID
+                 *     returns `404 not_found`. A well-formed but unknown project returns the same `401` as a bad signature, so
+                 *     the response never says whether a project exists.
+                 */
                 project_id: components["schemas"]["ProjectID"];
             };
             cookie?: never;
         };
-        requestBody: {
+        /** @description Any bytes up to 256 KB, verified exactly as received. Hookrelay sends the published JSON payload. */
+        requestBody?: {
             content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
+                /**
+                 * @example {
+                 *       "id": "inv_1",
+                 *       "amount": 1200
+                 *     }
+                 */
+                "application/json": unknown;
             };
         };
         responses: {
-            /** @description Signature valid; request accepted. */
+            /** @description Signature valid and the failure budget is used up (or `fail_first` is 0). Request accepted. */
             200: {
                 headers: {
+                    "X-Request-Id": components["headers"]["XRequestId"];
                     [name: string]: unknown;
                 };
                 content: {
+                    /**
+                     * @example {
+                     *       "received": true,
+                     *       "endpoint_id": "ep_01JC3ZM2H7Y9D4E6F8G0J1K2M3",
+                     *       "webhook_id": "msg_01JC3ZP4A5B6C7D8E9F0G1H2J3",
+                     *       "request_number": 3,
+                     *       "fail_first": 2
+                     *     }
+                     */
                     "application/json": components["schemas"]["DemoReceiverResult"];
                 };
             };
-            400: components["responses"]["ValidationError"];
-            401: components["responses"]["Unauthorized"];
-            404: components["responses"]["NotFound"];
-            413: components["responses"]["PayloadTooLarge"];
-            /** @description Simulated failure (`code` is `simulated_failure`), or a genuine internal error (`code` is `internal`). */
-            500: {
+            /** @description `fail_first` is not an integer from 0 to 10, or it was sent more than once. */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -1572,11 +1651,48 @@ export interface operations {
                     /**
                      * @example {
                      *       "error": {
-                     *         "code": "simulated_failure",
-                     *         "message": "demo receiver failing on purpose (request 1 of 2)"
+                     *         "code": "validation_error",
+                     *         "message": "fail_first must be between 0 and 10",
+                     *         "field": "fail_first"
                      *       }
                      *     }
                      */
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description Missing, repeated or malformed webhook headers, a timestamp outside the 5-minute tolerance, or no matching
+             *     signature (this includes an unknown project and a project without demo endpoints). Nothing was counted.
+             *     Code `unauthorized`, with a `WWW-Authenticate` header as on every 401.
+             */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The demo receiver is disabled on this deployment, or `project_id` is not a well-formed project ID. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            413: components["responses"]["PayloadTooLarge"];
+            /**
+             * @description A simulated failure (`code` is `simulated_failure`; the request was counted, and `n` is its number), or a
+             *     genuine internal error (`code` is `internal`). Hookrelay records either one as a failed attempt and retries
+             *     it on the normal schedule.
+             */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
                     "application/json": components["schemas"]["Error"];
                 };
             };

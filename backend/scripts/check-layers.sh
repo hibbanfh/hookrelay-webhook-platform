@@ -186,6 +186,22 @@ if [ -n "$out" ]; then
 	fail=1
 fi
 
+# 5g. table ownership (ADR 0017): demoreceiver owns demo_receiver_hits only. Its SQL names no table of
+# another module, and no other module names demo_receiver_hits (the cascade from endpoints is a
+# foreign key in the migration, not code).
+out=$(grep -rniE --include='*.go' --exclude='*_test.go' '(FROM|JOIN|INTO|UPDATE)[[:space:]]+(endpoints|messages|deliveries|attempts|projects|api_keys|idempotency_keys)([^a-z_]|$)' internal/demoreceiver 2>/dev/null)
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: demoreceiver: SQL on another module's table (ADR 0017)"
+	echo "$out"
+	fail=1
+fi
+out=$(grep -rn --include='*.go' --exclude='*_test.go' 'demo_receiver_hits' internal/project internal/endpoint internal/message internal/dispatch 2>/dev/null)
+if [ -n "$out" ]; then
+	echo "LAYER VIOLATION: another module names the demoreceiver table demo_receiver_hits (ADR 0017)"
+	echo "$out"
+	fail=1
+fi
+
 # 6. go list based double check on the innermost layer, when domain packages exist:
 # transitive deps may only be stdlib or other domain/* packages of the same module.
 for pkg in $(go list ./internal/*/domain/... 2>/dev/null); do
